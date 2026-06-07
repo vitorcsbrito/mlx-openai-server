@@ -275,8 +275,11 @@ def cli():
     default=None,
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
     help=(
-        "Directory for disk-backed prompt KV cache payloads. "
-        "Defaults to a process-local temporary directory."
+        "Directory for disk-backed prompt KV cache payloads. When set, the "
+        "cache persists across restarts and is rehydrated on startup (only "
+        "entries matching the same model and KV-cache configuration are "
+        "reused). Defaults to a process-local temporary directory that is "
+        "removed on shutdown."
     ),
 )
 @click.option(

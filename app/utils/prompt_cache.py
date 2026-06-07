@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import gc
+import hashlib
+import json
 from pathlib import Path
 import pickle
 import shutil
@@ -16,6 +18,58 @@ from loguru import logger
 from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
 
 from . import dill
+
+# Bumped whenever the on-disk sidecar schema or payload layout changes. Sidecars
+# written under a different version are ignored (and cleaned up) on rehydrate.
+CACHE_FORMAT_VERSION = 1
+
+
+def build_cache_fingerprint(
+    *,
+    model_path: str,
+    kv_bits: int | None,
+    kv_group_size: int,
+    quantized_kv_start: int,
+) -> str:
+    """Return a stable identity for the model + KV-cache configuration.
+
+    A persisted KV cache is only valid for the exact weights, tokenizer, and
+    quantization settings that produced it, under a compatible MLX
+    serialization layout. The fingerprint folds all of these in so that, on
+    restart, only payloads built by an identical configuration are adopted.
+
+    Parameters
+    ----------
+    model_path : str
+        Path or identifier of the loaded model (weights + tokenizer identity).
+    kv_bits : int | None
+        KV-cache quantization bit width, or ``None`` when disabled.
+    kv_group_size : int
+        KV-cache quantization group size.
+    quantized_kv_start : int
+        Step at which quantized KV caching begins.
+
+    Returns
+    -------
+    str
+        A short hex digest uniquely identifying the configuration.
+    """
+    try:
+        import mlx.core as mx  # noqa: PLC0415
+
+        mlx_version = getattr(mx, "__version__", "unknown")
+    except (ImportError, RuntimeError):
+        mlx_version = "unknown"
+
+    parts = [
+        str(model_path),
+        str(kv_bits),
+        str(kv_group_size),
+        str(quantized_kv_start),
+        mlx_version,
+        str(CACHE_FORMAT_VERSION),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -164,6 +218,13 @@ class LRUPromptCache:
     optional byte-based trimming. Only metadata is kept in memory; prompt-cache
     matrices are serialized to disk on insert and loaded only on cache hits.
 
+    When a caller-supplied ``cache_dir`` already contains payloads from a prior
+    run, the in-memory index is rebuilt from each payload's JSON sidecar at
+    construction time, so warm prefixes survive a restart. Adoption is gated by
+    ``fingerprint``: only entries produced by an identical model and KV-cache
+    configuration are reused; mismatched, stale, or corrupt entries are
+    discarded (and their files cleaned up) on startup.
+
     Parameters
     ----------
     max_size : int, optional
@@ -173,7 +234,13 @@ class LRUPromptCache:
         practically unbounded value.
     cache_dir : str | Path | None, optional
         Directory used to store serialized prompt caches. A process-local
-        temporary directory is created when omitted.
+        temporary directory is created (and removed on close) when omitted; a
+        caller-supplied directory persists across restarts and is rehydrated.
+    fingerprint : str, optional
+        Identity of the model and KV-cache configuration that produces these
+        payloads. Persisted into each sidecar and required to match for a
+        payload to be adopted on restart. Empty by default (no cross-restart
+        identity check). See :func:`build_cache_fingerprint`.
     """
 
     @dataclass
@@ -239,9 +306,15 @@ class LRUPromptCache:
         max_size: int = 10,
         max_bytes: int = 1 << 63,
         cache_dir: str | Path | None = None,
+        fingerprint: str = "",
     ) -> None:
         self.max_size = max_size
         self.max_bytes = max_bytes
+        # Identity of the model + KV-cache configuration that produces these
+        # payloads. Persisted into each sidecar; on restart, only entries whose
+        # fingerprint matches the running configuration are adopted, so a cache
+        # built for one model/quantization is never loaded into another.
+        self._fingerprint = fingerprint
         if cache_dir is None:
             self.cache_dir = Path(tempfile.mkdtemp(prefix="mlx-openai-prompt-cache-"))
             self._owns_cache_dir = True
@@ -254,6 +327,12 @@ class LRUPromptCache:
         self._n_bytes = 0
         self._n_bytes_by_type: dict[str, int] = dict.fromkeys(self._lru.ordering, 0)
 
+        # A caller-supplied directory may already hold payloads from a previous
+        # run; rebuild the in-memory index from their sidecars. Owned temp dirs
+        # are always fresh, so there is nothing to adopt.
+        if not self._owns_cache_dir:
+            self._rehydrate_from_disk()
+
     def __len__(self) -> int:
         return len(self._lru)
 
@@ -264,6 +343,11 @@ class LRUPromptCache:
     def _cache_file_path(self) -> Path:
         """Return a unique path for a serialized cache entry."""
         return self.cache_dir / f"{uuid.uuid4().hex}.pkl"
+
+    @staticmethod
+    def _sidecar_path(payload_path: Path) -> Path:
+        """Return the metadata-sidecar path for a payload ``{uuid}.pkl``."""
+        return payload_path.with_name(f"{payload_path.stem}.meta.json")
 
     def _write_cache_to_disk(self, prompt_cache: list[Any]) -> Path:
         """Serialize a prompt cache to disk and return its final path.
@@ -292,6 +376,37 @@ class LRUPromptCache:
         temp_path.replace(file_path)
         return file_path
 
+    def _write_sidecar(self, entry: CacheEntry, tokens_ids: list[int]) -> None:
+        """Write the JSON metadata sidecar for a payload.
+
+        The sidecar carries the trie key (``tokens``) and entry metadata so the
+        in-memory index can be rebuilt on restart without deserializing the
+        payload. It is written last (after the payload), via temp-then-replace,
+        so a crash can only ever leave a payload without a sidecar — a harmless
+        orphan that rehydrate discards — never the reverse.
+
+        Parameters
+        ----------
+        entry : CacheEntry
+            The freshly written cache entry whose payload is on disk.
+        tokens_ids : list[int]
+            Token sequence that keys this entry in the trie.
+        """
+        meta = {
+            "version": CACHE_FORMAT_VERSION,
+            "fingerprint": self._fingerprint,
+            "tokens": list(tokens_ids),
+            "nbytes": entry.nbytes,
+            "cache_type": entry.cache_type,
+            "trimmable": entry.trimmable,
+            "source": entry.source,
+        }
+        sidecar_path = self._sidecar_path(entry.file_path)
+        temp_path = sidecar_path.with_suffix(".json.tmp")
+        with temp_path.open("w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        temp_path.replace(sidecar_path)
+
     def _load_cache_from_disk(self, entry: CacheEntry) -> list[Any]:
         """Deserialize a prompt cache entry from disk."""
         with entry.file_path.open("rb") as f:
@@ -302,11 +417,12 @@ class LRUPromptCache:
         return cache
 
     def _delete_entry_file(self, entry: CacheEntry) -> None:
-        """Delete a serialized cache file, logging best-effort failures."""
-        try:
-            entry.file_path.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning(f"Failed to delete prompt cache file {entry.file_path}: {exc!s}")
+        """Delete a serialized cache file and its sidecar, logging failures."""
+        for path in (entry.file_path, self._sidecar_path(entry.file_path)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"Failed to delete prompt cache file {path}: {exc!s}")
 
     def _remove_entry_accounting(self, entry: CacheEntry) -> None:
         """Subtract an entry from in-memory byte accounting."""
@@ -355,6 +471,76 @@ class LRUPromptCache:
             mx.clear_cache()
         except (ImportError, RuntimeError) as exc:
             logger.debug(f"Could not clear MLX cache after prompt-cache eviction: {exc!s}")
+
+    def _discard_orphan(self, payload_path: Path, sidecar_path: Path) -> None:
+        """Best-effort delete of an unusable payload/sidecar pair."""
+        for path in (payload_path, sidecar_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug(f"Could not remove orphaned prompt cache file {path}: {exc!s}")
+
+    def _rehydrate_from_disk(self) -> None:
+        """Rebuild the trie, LRU, and byte accounting from on-disk sidecars.
+
+        Scans ``cache_dir`` for ``*.meta.json`` sidecars and adopts every entry
+        whose schema ``version`` and ``fingerprint`` match the running
+        configuration and whose payload still exists. Only metadata is loaded
+        into memory; payloads stay on disk and are deserialized lazily on the
+        first matching ``fetch_nearest_cache`` hit, exactly as in steady state.
+
+        True LRU recency does not survive a restart, so sidecars are adopted in
+        mtime order (oldest first) as a best-effort proxy. Mismatched, corrupt,
+        or half-written entries are discarded. After loading, ``max_size`` and
+        ``max_bytes`` are re-applied.
+        """
+        valid_types = set(self._lru.ordering)
+        adopted = skipped = 0
+        for sidecar_path in sorted(
+            self.cache_dir.glob("*.meta.json"),
+            key=lambda p: p.stat().st_mtime,
+        ):
+            payload_path = sidecar_path.with_name(f"{sidecar_path.stem.removesuffix('.meta')}.pkl")
+            try:
+                meta = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.debug(f"Discarding unreadable prompt cache sidecar {sidecar_path}: {exc!s}")
+                self._discard_orphan(payload_path, sidecar_path)
+                skipped += 1
+                continue
+
+            if (
+                meta.get("version") != CACHE_FORMAT_VERSION
+                or meta.get("fingerprint") != self._fingerprint
+                or meta.get("cache_type") not in valid_types
+                or not payload_path.exists()
+            ):
+                self._discard_orphan(payload_path, sidecar_path)
+                skipped += 1
+                continue
+
+            tokens = meta["tokens"]
+            cache_type = meta["cache_type"]
+            entry = self.CacheEntry(
+                payload_path,
+                int(meta["nbytes"]),
+                cache_type,
+                bool(meta["trimmable"]),
+                meta.get("source", "nonbatch"),
+            )
+            self._trie.add(tokens, entry)
+            self._lru.push(tuple(tokens), cache_type)
+            self._n_bytes += entry.nbytes
+            self._n_bytes_by_type[cache_type] += entry.nbytes
+            adopted += 1
+
+        if adopted or skipped:
+            # Honour configured limits now that the whole working set is indexed.
+            self.trim_to(n_sequences=self.max_size, n_bytes=self.max_bytes)
+            logger.info(
+                f"Rehydrated prompt cache from {self.cache_dir}: "
+                f"{adopted} adopted, {skipped} skipped, {self.nbytes / 1e9:.2f} GB indexed"
+            )
 
     def fetch_nearest_cache(
         self,
@@ -470,6 +656,9 @@ class LRUPromptCache:
             can_trim_prompt_cache(prompt_cache),
             source,
         )
+        # Persist the metadata sidecar so this entry can be rebuilt after a
+        # restart without loading the payload (see _rehydrate_from_disk).
+        self._write_sidecar(entry, tokens_ids)
 
         # Insert into the trie and update the byte counter and lru position
         self._n_bytes += entry.nbytes

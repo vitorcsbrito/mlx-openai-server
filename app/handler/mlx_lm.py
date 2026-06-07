@@ -172,8 +172,10 @@ class MLXLMHandler:
         prompt_cache_max_bytes : int
             Maximum total bytes retained by prompt KV caches before eviction.
         prompt_cache_dir : str | None
-            Directory used for disk-backed prompt KV cache payloads. If None,
-            a process-local temporary directory is used.
+            Directory used for disk-backed prompt KV cache payloads. When set,
+            the cache persists across restarts and is rehydrated on startup
+            (gated by a model/KV-config fingerprint). If None, a process-local
+            temporary directory is used and removed on shutdown.
         kv_bits : int | None
             Number of bits for KV cache quantization. None disables quantization.
         kv_group_size : int
@@ -195,7 +197,7 @@ class MLXLMHandler:
         """
         self.model_path = model_path
         from ..models.mlx_lm import MLX_LM
-        from ..utils.prompt_cache import LRUPromptCache
+        from ..utils.prompt_cache import LRUPromptCache, build_cache_fingerprint
 
         self.model = MLX_LM(
             model_path,
@@ -220,10 +222,20 @@ class MLXLMHandler:
         self.debug = debug
         self.reasoning_parser_name = reasoning_parser
         self.tool_parser_name = tool_call_parser
+        # Identity of the weights + KV-cache configuration that produce cache
+        # payloads. Gates cross-restart adoption so a persisted cache is never
+        # reused under a different model or quantization setting.
+        prompt_cache_fingerprint = build_cache_fingerprint(
+            model_path=model_path,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+        )
         self.prompt_cache = LRUPromptCache(
             max_size=prompt_cache_size,
             max_bytes=prompt_cache_max_bytes,
             cache_dir=prompt_cache_dir,
+            fingerprint=prompt_cache_fingerprint,
         )
         self.message_converter = MessageConverterManager.create_converter(
             converter_name=message_converter,

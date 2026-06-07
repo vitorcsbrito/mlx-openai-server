@@ -265,7 +265,7 @@ LM-specific memory and batching options:
 | `--disable-batching` | `false` | Disable continuous batching; required if per-request positive `seed` values must be honored |
 | `--prompt-cache-size` | `10` | Retained prompt KV cache entries |
 | `--max-bytes` | unbounded | Prompt KV cache byte budget |
-| `--prompt-cache-dir` | temp dir | Directory for disk-backed prompt KV cache payloads |
+| `--prompt-cache-dir` | temp dir | Directory for disk-backed prompt KV cache payloads; when set, the cache persists across restarts and is rehydrated on startup (reused only for a matching model/KV-cache config) |
 | `--kv-bits` | unset | KV cache quantization bits, usually `4` or `8` |
 | `--kv-group-size` | `64` | KV quantization group size |
 | `--quantized-kv-start` | `0` | Token step where KV quantization starts |
