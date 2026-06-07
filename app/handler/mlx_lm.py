@@ -86,6 +86,66 @@ def _strip_complete_tool_blocks(text: str, tool_open: str, tool_close: str) -> s
     return "".join(pieces)
 
 
+def _recover_misplaced_tool_calls(
+    parsed_response: dict[str, Any],
+    tool_parser: Any,
+    *,
+    debug: bool = False,
+) -> None:
+    """Recover tool-call blocks the model emitted inside the reasoning span.
+
+    Non fine-tuned models sometimes "think out loud" and emit a complete
+    ``<tool_call>...</tool_call>`` block inside the reasoning span.
+    ``extract_reasoning`` swallows everything between the reasoning open/close
+    tags into ``reasoning_content``, so the tool parser (which only sees the
+    post-reasoning tail) would otherwise drop that call. This rescans the
+    reasoning text and promotes any recovered calls, stripping them out of the
+    reasoning content. It mutates ``parsed_response`` in place and only acts as a
+    fallback when no tool calls were recovered from the post-reasoning content,
+    so models that behave correctly are unaffected.
+
+    Parameters
+    ----------
+    parsed_response : dict[str, Any]
+        Parsed response dict with ``reasoning_content`` and ``tool_calls`` keys.
+    tool_parser : Any
+        Tool parser exposing ``extract_tool_calls``/``get_tool_open``/``get_tool_close``.
+    debug : bool, optional
+        When True, emit a parser debug event for the recovery, by default False.
+    """
+    reasoning_text = parsed_response.get("reasoning_content")
+    if (
+        tool_parser is None
+        or parsed_response.get("tool_calls")
+        or not isinstance(reasoning_text, str)
+        or tool_parser.get_tool_open() not in reasoning_text
+    ):
+        return
+
+    recovered_content = tool_parser.extract_tool_calls(reasoning_text)
+    recovered_calls = recovered_content.get("tool_calls") if recovered_content else None
+    if not recovered_calls:
+        return
+
+    if debug:
+        log_debug_parser_event(
+            component="mlx_lm.nonstream.tool.selfheal",
+            chunk_index=0,
+            phase="recover-from-reasoning",
+            parser=tool_parser,
+            text=reasoning_text,
+            parsed_content=recovered_content,
+            is_complete=True,
+        )
+    parsed_response["tool_calls"] = recovered_calls
+    cleaned_reasoning = _strip_complete_tool_blocks(
+        reasoning_text,
+        tool_parser.get_tool_open(),
+        tool_parser.get_tool_close(),
+    )
+    parsed_response["reasoning_content"] = cleaned_reasoning or None
+
+
 @dataclass
 class _InferenceContext:
     """Pre-processed inference state shared by stream and non-stream paths."""
@@ -1509,6 +1569,10 @@ class MLXLMHandler:
                                 tool_parser.get_tool_close(),
                             )
                             parsed_response["content"] = stripped_content or None
+
+                # Self-healing: recover well-formed tool-call blocks that the model
+                # emitted *inside* the reasoning span (see helper for details).
+                _recover_misplaced_tool_calls(parsed_response, tool_parser, debug=self.debug)
             else:
                 parsed_response["content"] = response_text
 

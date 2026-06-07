@@ -395,6 +395,102 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         assert "<think>" not in visible_content
         assert "<tool_call>" not in visible_content
 
+    def test_nonstream_recovers_tool_call_emitted_inside_reasoning_block(self) -> None:
+        """Self-healing recovers a well-formed tool call stranded inside ``<think>``.
+
+        Non fine-tuned models sometimes "think out loud" and emit a complete
+        ``<tool_call>`` block inside the reasoning span. ``extract_reasoning``
+        swallows that span into ``reasoning_content``, so the tool parser (which
+        only sees the post-``</think>`` tail) would otherwise miss it.
+        """
+        handler_cls = _load_mlx_lm_handler_class()
+        handler = object.__new__(handler_cls)
+
+        handler.debug = False
+        handler.message_converter = None
+        handler.enable_auto_tool_choice = False
+        handler.reasoning_parser_name = "qwen3_moe"
+        handler.tool_parser_name = "hermes"
+        handler.model = _FakeModel()
+        handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
+        handler.inference_worker = _FakeInferenceWorker(
+            non_stream_response=_FakeNonStreamResponse(
+                text=(
+                    "<think>\n"
+                    "I should read the file to answer this.\n"
+                    '<tool_call>{"name":"read_file","arguments":{"path":"app/handler/mlx_lm.py"}}</tool_call>\n'
+                    "</think>\n"
+                ),
+                tokens=[1, 2, 3],
+                prompt_tokens=100,
+                generation_tokens=20,
+            )
+        )
+
+        async def _fake_prepare_text_request(
+            self: object, request: object
+        ) -> tuple[list[dict[str, str]], dict[str, object]]:
+            return [{"role": "user", "content": "hello"}], {"chat_template_kwargs": {}}
+
+        handler._prepare_text_request = types.MethodType(_fake_prepare_text_request, handler)
+
+        result = asyncio.run(handler.generate_text_response(request=object()))
+        parsed = result["response"]
+
+        assert isinstance(parsed, dict)
+        assert isinstance(parsed.get("tool_calls"), list)
+        assert len(parsed["tool_calls"]) == 1
+        assert parsed["tool_calls"][0]["name"] == "read_file"
+        assert json.loads(parsed["tool_calls"][0]["arguments"]) == {"path": "app/handler/mlx_lm.py"}
+        # The recovered tool-call block must be stripped from the reasoning text.
+        reasoning = parsed.get("reasoning_content")
+        if isinstance(reasoning, str):
+            assert "<tool_call>" not in reasoning
+            assert "I should read the file" in reasoning
+
+    def test_nonstream_does_not_recover_when_post_reasoning_tool_call_exists(self) -> None:
+        """Self-healing must not fire when the normal post-``</think>`` path succeeds."""
+        handler_cls = _load_mlx_lm_handler_class()
+        handler = object.__new__(handler_cls)
+
+        handler.debug = False
+        handler.message_converter = None
+        handler.enable_auto_tool_choice = False
+        handler.reasoning_parser_name = "qwen3_moe"
+        handler.tool_parser_name = "hermes"
+        handler.model = _FakeModel()
+        handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
+        handler.inference_worker = _FakeInferenceWorker(
+            non_stream_response=_FakeNonStreamResponse(
+                text=(
+                    "<think>\nplanning the call\n</think>\n"
+                    '<tool_call>{"name":"list_dir","arguments":{"path":"app"}}</tool_call>\n'
+                ),
+                tokens=[1, 2, 3],
+                prompt_tokens=100,
+                generation_tokens=20,
+            )
+        )
+
+        async def _fake_prepare_text_request(
+            self: object, request: object
+        ) -> tuple[list[dict[str, str]], dict[str, object]]:
+            return [{"role": "user", "content": "hello"}], {"chat_template_kwargs": {}}
+
+        handler._prepare_text_request = types.MethodType(_fake_prepare_text_request, handler)
+
+        result = asyncio.run(handler.generate_text_response(request=object()))
+        parsed = result["response"]
+
+        assert isinstance(parsed, dict)
+        assert isinstance(parsed.get("tool_calls"), list)
+        assert len(parsed["tool_calls"]) == 1
+        assert parsed["tool_calls"][0]["name"] == "list_dir"
+        # Reasoning content stays intact; the genuine reasoning span had no tool call.
+        assert parsed.get("reasoning_content") == "<think>\nplanning the call\n"
+
     def test_stream_step35_parses_tool_call_when_output_starts_with_stray_think_close(self) -> None:
         """Streaming should parse tool calls even when output starts with stray ``</think>``."""
         handler_cls = _load_mlx_lm_handler_class()
