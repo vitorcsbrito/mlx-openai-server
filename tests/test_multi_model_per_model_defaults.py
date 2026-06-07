@@ -239,8 +239,9 @@ async def test_chat_completions_can_apply_different_defaults_per_model(
         _handler: Any,
         request: ChatCompletionRequest,
         request_id: str | None = None,
+        raw_request: Any = None,
     ) -> JSONResponse:
-        del request_id
+        del request_id, raw_request
         captured_requests.append(request.model_copy(deep=True))
         return JSONResponse(content={"ok": True})
 
@@ -356,8 +357,9 @@ async def test_single_model_implicit_handler_defaults_do_not_shadow_env_defaults
         _handler: Any,
         request: ChatCompletionRequest,
         request_id: str | None = None,
+        raw_request: Any = None,
     ) -> JSONResponse:
-        del request_id
+        del request_id, raw_request
         captured_requests.append(request.model_copy(deep=True))
         return JSONResponse(content={"ok": True})
 
@@ -426,8 +428,9 @@ async def test_chat_completions_explicit_request_values_override_model_defaults(
         _handler: Any,
         request: ChatCompletionRequest,
         request_id: str | None = None,
+        raw_request: Any = None,
     ) -> JSONResponse:
-        del request_id
+        del request_id, raw_request
         captured_requests.append(request.model_copy(deep=True))
         return JSONResponse(content={"ok": True})
 
@@ -700,8 +703,9 @@ async def test_chat_completions_omitted_model_uses_backward_compatible_fallback_
         handler: Any,
         request: ChatCompletionRequest,
         request_id: str | None = None,
+        raw_request: Any = None,
     ) -> JSONResponse:
-        del request_id
+        del request_id, raw_request
         captured_handlers.append(handler)
         captured_requests.append(request.model_copy(deep=True))
         return JSONResponse(content={"ok": True})
@@ -738,8 +742,9 @@ async def test_chat_completions_omitted_model_does_not_fallback_to_non_chat_hand
         handler: Any,
         request: ChatCompletionRequest,
         request_id: str | None = None,
+        raw_request: Any = None,
     ) -> JSONResponse:
-        del request, request_id
+        del request, request_id, raw_request
         captured_handlers.append(handler)
         return JSONResponse(content={"ok": True})
 
