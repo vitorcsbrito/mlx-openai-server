@@ -84,7 +84,59 @@ def auto_segment_messages(roles: list[dict]) -> tuple[list[list[int]], list[str]
 
 **File:** `app/handler/mlx_lm.py`
 
-Modify `_generate_streamed_response()` around line 339 where `insert_cache()` is called:
+### 3.1 Add refined_messages to InferenceContext
+
+**Location:** Around line 1315 where `_InferenceContext` is defined
+
+**Current:**
+```python
+@dataclass
+class _InferenceContext:
+    rest_input_ids: list[int]
+    cache: list[Any] | None
+    cache_key: list[int]
+    total_input_tokens: int
+    total_cached_tokens: int
+    model_params: dict[str, Any]
+    parsers_result: ParserManager
+    prompt_progress_callback: Callable | None
+    checkpoint_position: int | None
+    checkpoint_callback: Callable | None
+    batched_segments: list[list[int]] | None
+    batched_segment_types: list[str] | None
+```
+
+**Add:**
+```python
+    refined_messages: list[dict[str, Any]]  # NEW
+```
+
+### 3.2 Pass refined_messages to context
+
+**Location:** Around line 1315 where `_InferenceContext()` is instantiated
+
+**Add to constructor call:**
+```python
+return _InferenceContext(
+    rest_input_ids=input_ids,
+    cache=None,
+    cache_key=input_ids[:],
+    total_input_tokens=len(input_ids),
+    total_cached_tokens=0,
+    model_params=model_params,
+    parsers_result=parsers_result,
+    prompt_progress_callback=(make_prompt_progress_callback() if self.debug else None),
+    checkpoint_position=None,
+    checkpoint_callback=None,
+    batched_segments=segments,
+    batched_segment_types=segment_types,
+    refined_messages=refined_messages,  # NEW
+)
+```
+
+### 3.3 Modify cache insertion in _generate_streamed_response
+
+**Location:** Around line 339 where `insert_cache()` is called
 
 **Current code:**
 ```python
@@ -103,7 +155,7 @@ finally:
         try:
             if self.config.prompt_cache_auto_segment:
                 # Auto-segment the full generated response
-                segments, segment_types = self.auto_segment_messages(self.messages)
+                segments, segment_types = self.auto_segment_messages(ctx.refined_messages)
                 
                 # Insert each segment separately
                 for i, segment in enumerate(segments):
@@ -118,8 +170,6 @@ finally:
         except Exception as cache_error:  # noqa: BLE001 - cache persistence is best-effort
             logger.warning(f"Failed to persist prompt cache: {cache_error}")
 ```
-
-**Note:** Need to pass `self.messages` to the function where roles are available.
 
 ---
 
@@ -167,14 +217,14 @@ CACHE_FORMAT_VERSION = 2  # Bump from 1 to 2
 ## Phase 6: Verification Steps
 
 1. **Verify current segment handling:**
-   - Locate where segments are created in current code
-   - Trace segment flow from creation to cache insertion
-   - Confirm where the full generated response is available
+   - ✅ Located in `_build_inference_context()` at lines 461-471 (prefill)
+   - ✅ Cache insertion at line 339 (generation)
+   - ✅ Messages available as `refined_messages` in context
 
 2. **Verify cache insertion path:**
-   - Find where `insert_cache()` is called
-   - Check if segments are already present or need to be computed
-   - Confirm the timing of when segments should be auto-calculated
+   - ✅ `insert_cache()` called in `_generate_streamed_response()` 
+   - ✅ Full generated response passed as single segment currently
+   - ✅ Auto-segmentation should happen at this point
 
 3. **Verify current `max_bytes` behavior:**
    - Check default value in constructor
@@ -186,20 +236,19 @@ CACHE_FORMAT_VERSION = 2  # Bump from 1 to 2
 ## Key Questions to Answer Before Implementation:
 
 1. **Current segment handling:** 
-   - Where exactly in the code is the full generated response available when inserting cache?
-   - Is the segment creation already happening somewhere, or is it missing?
+   - ✅ Prefill: segments created for non-trimmable caches only
+   - ✅ Generation: no segments, full response as single segment
 
 2. **Timing of auto-segmentation:**
-   - Should it happen in the same function where cache insertion occurs?
-   - Or in a separate preprocessing step?
+   - ✅ Should happen in `_generate_streamed_response()` where cache insertion occurs
 
 3. **Segment cache handling:**
-   - Will each segment use the same cache object, or separate cache objects?
-   - How do we track which segment produced which cache?
+   - ✅ Each segment uses same cache object
+   - ✅ Segment types track the role (system, assistant, user)
 
 4. **Backward compatibility verification:**
-   - What happens when `prompt_cache_auto_segment=False`?
-   - Does existing code continue to work without modification?
+   - ✅ When `prompt_cache_auto_segment=False`, existing behavior preserved
+   - ✅ Existing code continues to work without modification
 
 ---
 
@@ -207,10 +256,12 @@ CACHE_FORMAT_VERSION = 2  # Bump from 1 to 2
 
 1. **Tokenization:** The `tokenize()` function must be imported from the same module where it's used in the current codebase.
 
-2. **Message tracking:** The `messages` parameter must be available in the scope where `insert_cache()` is called. May need to pass it as an additional parameter to the generation function.
+2. **Message tracking:** Messages are available as `refined_messages` in `_build_inference_context()` and passed to the context.
 
 3. **Performance:** Auto-segmentation adds O(n) complexity where n is the number of role changes. For most conversations this is negligible (< 10 segments).
 
 4. **Memory:** Each segment creates a separate cache entry, increasing metadata overhead by 10-20% in tool-heavy workloads.
 
 5. **Cache compatibility:** Version bump to 2 means old caches will be automatically cleaned up on restart. Users may need to regenerate caches after upgrade.
+
+6. **Critical dependency:** `refined_messages` must be added to `_InferenceContext` dataclass to pass from `_build_inference_context()` to `_generate_streamed_response()`.
