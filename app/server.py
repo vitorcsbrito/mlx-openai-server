@@ -634,6 +634,10 @@ def setup_server(config_args: MLXServerConfig | MultiModelServerConfig) -> uvico
         implementation details to clients.
         """
         logger.error(f"Global exception handler caught: {exc!s}", exc_info=True)
+        # A failed/timed-out request may have left GPU allocations behind;
+        # reclaim them so one error does not cascade into OOM on later requests.
+        _clear_mlx_cache()
+        gc.collect()
         return JSONResponse(
             status_code=500,
             content={"error": {"message": "Internal server error", "type": "internal_error"}},
