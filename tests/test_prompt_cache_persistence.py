@@ -227,6 +227,49 @@ def test_eviction_removes_sidecar(
     assert len(_sidecars(tmp_path)) == 1
 
 
+def test_rehydrate_sweeps_sidecarless_payload(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Payloads without a sidecar (e.g. from an older version) are swept."""
+    module = _load_prompt_cache_module(monkeypatch)
+
+    first = module.LRUPromptCache(max_size=10, cache_dir=tmp_path, fingerprint="fp-A")
+    first.insert_cache([1, 2, 3], [_FakeCacheLayer("current")])
+    live_payload = first._trie.get([1, 2, 3]).file_path
+
+    # An orphan left behind by a pre-sidecar server version.
+    orphan = tmp_path / "deadbeef.pkl"
+    orphan.write_bytes(b"legacy payload with no sidecar")
+
+    second = module.LRUPromptCache(max_size=10, cache_dir=tmp_path, fingerprint="fp-A")
+
+    assert not orphan.exists()
+    assert live_payload.exists()
+    assert len(second) == 1
+    result, rest = second.fetch_nearest_cache([1, 2, 3])
+    assert rest == []
+    assert result is not None and result[0].value == "current"
+
+
+def test_rehydrate_sweeps_temp_files(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Interrupted-write temp files (payload and sidecar) are swept."""
+    module = _load_prompt_cache_module(monkeypatch)
+
+    payload_tmp = tmp_path / "aaaa.tmp"
+    sidecar_tmp = tmp_path / "bbbb.meta.json.tmp"
+    payload_tmp.write_bytes(b"half-written payload")
+    sidecar_tmp.write_text("{half written")
+
+    module.LRUPromptCache(max_size=10, cache_dir=tmp_path, fingerprint="fp-A")
+
+    assert not payload_tmp.exists()
+    assert not sidecar_tmp.exists()
+
+
 def test_close_preserves_payloads_for_configured_dir(
     monkeypatch: Any,
     tmp_path: Path,

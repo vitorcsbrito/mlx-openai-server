@@ -492,9 +492,13 @@ class LRUPromptCache:
         True LRU recency does not survive a restart, so sidecars are adopted in
         mtime order (oldest first) as a best-effort proxy. Mismatched, corrupt,
         or half-written entries are discarded. After loading, ``max_size`` and
-        ``max_bytes`` are re-applied.
+        ``max_bytes`` are re-applied, then any orphaned payload or temp files
+        (``*.pkl`` without a live sidecar, plus ``*.tmp`` from interrupted
+        writes) are swept — this reclaims caches left by an older server version
+        that did not write sidecars.
         """
         valid_types = set(self._lru.ordering)
+        kept_payloads: set[Path] = set()
         adopted = skipped = 0
         for sidecar_path in sorted(
             self.cache_dir.glob("*.meta.json"),
@@ -532,15 +536,52 @@ class LRUPromptCache:
             self._lru.push(tuple(tokens), cache_type)
             self._n_bytes += entry.nbytes
             self._n_bytes_by_type[cache_type] += entry.nbytes
+            kept_payloads.add(payload_path)
             adopted += 1
 
+        # Honour configured limits before sweeping so trimmed payloads are
+        # deleted through the normal eviction path, not left as orphans.
         if adopted or skipped:
-            # Honour configured limits now that the whole working set is indexed.
             self.trim_to(n_sequences=self.max_size, n_bytes=self.max_bytes)
+
+        swept = self._sweep_orphan_files(kept_payloads)
+
+        if adopted or skipped or swept:
             logger.info(
                 f"Rehydrated prompt cache from {self.cache_dir}: "
-                f"{adopted} adopted, {skipped} skipped, {self.nbytes / 1e9:.2f} GB indexed"
+                f"{adopted} adopted, {skipped} skipped, {swept} swept, "
+                f"{self.nbytes / 1e9:.2f} GB indexed"
             )
+
+    def _sweep_orphan_files(self, kept_payloads: set[Path]) -> int:
+        """Delete orphaned payload and temp files from the cache directory.
+
+        Removes ``*.pkl`` payloads not referenced by an adopted sidecar (e.g.
+        caches written by an older version that did not produce sidecars) and
+        all ``*.tmp`` files (``*.tmp`` payload temps and ``*.meta.json.tmp``
+        sidecar temps left by interrupted writes). Adopted sidecars themselves
+        (``*.meta.json``) are never matched and so are preserved.
+
+        Parameters
+        ----------
+        kept_payloads : set[Path]
+            Payload paths that were adopted this run and must be retained.
+
+        Returns
+        -------
+        int
+            Number of files removed.
+        """
+        swept = 0
+        for stray in (*self.cache_dir.glob("*.pkl"), *self.cache_dir.glob("*.tmp")):
+            if stray.suffix == ".pkl" and stray in kept_payloads:
+                continue
+            try:
+                stray.unlink(missing_ok=True)
+                swept += 1
+            except OSError as exc:
+                logger.debug(f"Could not sweep orphaned prompt cache file {stray}: {exc!s}")
+        return swept
 
     def fetch_nearest_cache(
         self,
