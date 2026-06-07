@@ -791,6 +791,19 @@ class BatchScheduler:
                 logger.warning(
                     f"prompt_cache.insert_cache ({cache_type}) failed for uid={uid}: {exc!s}"
                 )
+                # A failed checkpoint insert is commonly a Metal OOM raised while
+                # the KV cache is materialized for serialization. Swallowing it
+                # without reclaiming leaves the allocator exhausted, so the next
+                # request (and any retry) OOMs immediately. Drop every extracted
+                # cache reference and trim MLX buffers before bailing out so the
+                # process can recover instead of cascading.
+                cache = None
+                caches.clear()
+                try:
+                    mx.clear_cache()
+                except Exception as clear_exc:  # noqa: BLE001 — reclaim is best-effort
+                    logger.warning(f"mx.clear_cache after failed insert failed: {clear_exc!s}")
+                return
 
     def _handle_generation_response(self, resp: Any) -> None:
         """Forward a single generation-batch response to the owning request."""

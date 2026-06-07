@@ -773,3 +773,52 @@ async def test_submit_stream_raises_queue_full_when_admission_queue_is_saturated
 
     with pytest.raises(asyncio.QueueFull):
         scheduler.submit_stream(input_ids=[2], max_tokens=4)
+
+
+def test_failed_checkpoint_insert_reclaims_mlx_memory(patched_scheduler):
+    """A failed checkpoint insert must reclaim MLX buffers and not propagate.
+
+    Regression for the OOM cascade: when ``insert_cache`` raises (commonly a
+    Metal OOM while the KV cache is materialized for serialization), the
+    scheduler must drop the extracted cache references and trim MLX buffers so
+    the next request does not inherit an exhausted allocator and OOM as well.
+    """
+    bsm = patched_scheduler
+
+    clear_calls: list[int] = []
+    bsm.pytest_monkeypatch.setattr(bsm.mx, "clear_cache", lambda: clear_calls.append(1))
+
+    class _RaisingPromptCache:
+        def insert_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("[METAL] Insufficient memory")
+
+    extracted_cache = object()
+
+    class _FakeBatchGeneratorWithCache:
+        def extract_cache(self, uids: list[int]) -> dict[int, tuple[Any, list[int]]]:
+            return {uid: (extracted_cache, [1, 2, 3]) for uid in uids}
+
+    scheduler = bsm.BatchScheduler(
+        model=object(),
+        tokenizer=FakeTokenizer(),
+    )
+    scheduler._prompt_cache = _RaisingPromptCache()
+    scheduler._batch_generator = _FakeBatchGeneratorWithCache()
+    scheduler._active = {
+        7: bsm._ActiveRequest(
+            loop=None,
+            out_queue=None,
+            detokenizer=None,
+            cancel_event=threading.Event(),
+            prompt_tokens=3,
+            cached_prompt_tokens=0,
+            pending_segment_types=["tool"],
+        )
+    }
+
+    response = types.SimpleNamespace(uid=7, end_of_segment=True, end_of_prompt=False)
+
+    # Must not raise despite the failing insert.
+    scheduler._handle_prompt_responses([response])
+
+    assert clear_calls, "expected mx.clear_cache() after a failed checkpoint insert"
