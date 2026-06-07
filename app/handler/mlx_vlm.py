@@ -226,13 +226,71 @@ class MLXVLMHandler:
         text_parts: list[str] = []
         tokens: list[int] = []
         final_chunk = None
-        async for chunk in stream:
-            if chunk.text:
-                text_parts.append(chunk.text)
-            tokens.append(chunk.token)
-            if chunk.finish_reason is not None:
-                final_chunk = chunk
-                break
+        try:
+            async for chunk in stream:
+                if chunk.text:
+                    text_parts.append(chunk.text)
+                tokens.append(chunk.token)
+                if chunk.finish_reason is not None:
+                    final_chunk = chunk
+                    break
+        finally:
+            # Closing the generator promptly sets the scheduler's per-request
+            # cancel_event so a cancelled/disconnected request is removed from
+            # the batch instead of generating to completion.
+            await stream.aclose()
+
+        return CompletionResponse(
+            text="".join(text_parts),
+            tokens=tokens,
+            peak_memory=final_chunk.peak_memory if final_chunk else 0.0,
+            generation_tps=final_chunk.generation_tps if final_chunk else 0.0,
+            prompt_tps=final_chunk.prompt_tps if final_chunk else 0.0,
+            prompt_tokens=(
+                final_chunk.prompt_tokens
+                if final_chunk
+                else self.model.count_prompt_tokens(model_params.get("model_inputs") or {})
+            ),
+            generation_tokens=final_chunk.generation_tokens if final_chunk else len(tokens),
+        )
+
+    async def _collect_nonbatched_response(
+        self,
+        input_prompt: str,
+        model_params: dict[str, Any],
+    ):
+        """Drain the single-request VLM stream into a completion response.
+
+        Runs through ``submit_stream`` and accumulates here rather than via a
+        single blocking ``submit`` call, so a client disconnect can cancel
+        generation between tokens: closing this async generator sets the
+        inference worker's ``cancel_event``, which breaks the worker loop.
+        """
+        from ..models.mlx_vlm import CompletionResponse
+
+        stream = self.inference_worker.submit_stream(
+            self.model,
+            prompt=input_prompt,
+            stream=True,
+            verbose=self.debug,
+            **model_params,
+        )
+        text_parts: list[str] = []
+        tokens: list[int] = []
+        final_chunk = None
+        try:
+            async for chunk in stream:
+                if chunk is None:
+                    continue
+                if chunk.text:
+                    text_parts.append(chunk.text)
+                tokens.append(chunk.token)
+                if chunk.finish_reason is not None:
+                    final_chunk = chunk
+        finally:
+            # Closing the generator promptly sets the worker's cancel_event so a
+            # cancelled/disconnected request stops generating mid-stream.
+            await stream.aclose()
 
         return CompletionResponse(
             text="".join(text_parts),
@@ -600,13 +658,7 @@ class MLXVLMHandler:
                 scheduler = await self._get_or_start_scheduler()
                 response = await self._collect_batched_response(scheduler, model_params)
             else:
-                response = await self.inference_worker.submit(
-                    self.model,
-                    prompt=input_prompt,
-                    stream=False,
-                    verbose=self.debug,
-                    **model_params,
-                )
+                response = await self._collect_nonbatched_response(input_prompt, model_params)
 
             parsed_response = {"reasoning_content": None, "tool_calls": None, "content": None}
             response_text = response.text

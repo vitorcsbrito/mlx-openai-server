@@ -307,23 +307,6 @@ class MLXLMHandler:
         with self._generation_lock:
             yield from self.model(*args, **kwargs)
 
-    def _generate_with_lock_and_cache_persist(
-        self,
-        cache_key: list[int],
-        cache: list[Any] | None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        """Run non-stream generation and persist its prompt cache on the worker thread."""
-        with self._generation_lock:
-            response = self.model(*args, **kwargs)
-            if cache is not None:
-                try:
-                    self.prompt_cache.insert_cache(cache_key + response.tokens, cache)
-                except Exception as cache_error:  # noqa: BLE001 - cache persistence is best-effort
-                    logger.warning(f"Failed to persist prompt cache: {cache_error}")
-            return response
-
     def _stream_with_lock_and_cache_persist(
         self,
         cache_key: list[int],
@@ -1361,14 +1344,61 @@ class MLXLMHandler:
         if self._is_request_batchable(request) and ctx.checkpoint_position is None:
             scheduler = await self._get_or_start_scheduler()
             return await self._collect_batched_response(scheduler, ctx)
-        return await self.inference_worker.submit(
-            self._generate_with_lock_and_cache_persist,
+        return await self._collect_nonbatched_response(ctx, request_data)
+
+    async def _collect_nonbatched_response(
+        self,
+        ctx: "_InferenceContext",
+        request_data: dict[str, Any],
+    ) -> Any:
+        """Drain the single-request stream into a ``CompletionResponse``.
+
+        The non-batched non-streaming path runs through ``submit_stream`` and
+        accumulates here rather than via a single blocking ``submit`` call, so
+        a client disconnect can cancel generation between tokens: closing this
+        async generator sets the inference worker's ``cancel_event``, which
+        breaks the worker loop. The accumulated result is identical to the
+        model's own non-streaming :class:`~app.models.mlx_lm.CompletionResponse`.
+        """
+        # Lazy import — tests stub ``app.models.mlx_lm`` with a minimal fake
+        # that doesn't export CompletionResponse; a module-level import would
+        # break those test setups.
+        from ..models.mlx_lm import CompletionResponse
+
+        stream = self.inference_worker.submit_stream(
+            self._stream_with_lock_and_cache_persist,
             list(ctx.cache_key),
             ctx.cache,
             input_ids=ctx.rest_input_ids,
             prompt_cache=ctx.cache,
-            stream=False,
+            stream=True,
             **request_data,
+        )
+        text_parts: list[str] = []
+        tokens: list[int] = []
+        final_chunk = None
+        try:
+            async for chunk in stream:
+                if chunk is None:
+                    continue
+                if chunk.text:
+                    text_parts.append(chunk.text)
+                tokens.append(chunk.token)
+                if chunk.finish_reason:
+                    final_chunk = chunk
+        finally:
+            # Closing the generator promptly sets the worker's cancel_event so a
+            # cancelled/disconnected request stops generating mid-stream.
+            await stream.aclose()
+
+        return CompletionResponse(
+            text="".join(text_parts),
+            tokens=tokens,
+            peak_memory=final_chunk.peak_memory if final_chunk else 0.0,
+            generation_tps=final_chunk.generation_tps if final_chunk else 0.0,
+            prompt_tps=final_chunk.prompt_tps if final_chunk else 0.0,
+            prompt_tokens=(final_chunk.prompt_tokens if final_chunk else len(ctx.rest_input_ids)),
+            generation_tokens=final_chunk.generation_tokens if final_chunk else len(tokens),
         )
 
     async def _collect_batched_response(
@@ -1392,13 +1422,19 @@ class MLXLMHandler:
         text_parts: list[str] = []
         tokens: list[int] = []
         final_chunk = None
-        async for chunk in stream:
-            if chunk.text:
-                text_parts.append(chunk.text)
-            tokens.append(chunk.token)
-            if chunk.finish_reason is not None:
-                final_chunk = chunk
-                break
+        try:
+            async for chunk in stream:
+                if chunk.text:
+                    text_parts.append(chunk.text)
+                tokens.append(chunk.token)
+                if chunk.finish_reason is not None:
+                    final_chunk = chunk
+                    break
+        finally:
+            # Closing the generator promptly sets the scheduler's per-request
+            # cancel_event so a cancelled/disconnected request is removed from
+            # the batch instead of generating to completion.
+            await stream.aclose()
 
         generation_tokens = final_chunk.generation_tokens if final_chunk else len(tokens)
         generation_tps = final_chunk.generation_tps if final_chunk else 0.0

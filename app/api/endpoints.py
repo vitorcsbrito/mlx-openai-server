@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import suppress
 from http import HTTPStatus
 import json
 import os
 import random
 import time
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,6 +21,7 @@ from openai.types.responses import FunctionTool
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_message import ResponseOutputMessage, ResponseOutputText
 from openai.types.responses.response_reasoning_item import Content, ResponseReasoningItem, Summary
+from starlette.requests import ClientDisconnect
 
 from ..schemas.openai import (
     ChatCompletionChunk,
@@ -616,8 +619,20 @@ async def chat_completions(
 
         try:
             if handler_type == "multimodal":
-                return await process_multimodal_request(handler, request, request_id)
-            return await process_text_request(handler, request, request_id)
+                return await process_multimodal_request(
+                    handler, request, request_id, raw_request=raw_request
+                )
+            return await process_text_request(handler, request, request_id, raw_request=raw_request)
+        except ClientDisconnect:
+            # The client (e.g. an agent cancelling the request) closed the
+            # connection; generation was already cancelled in the guard. Return
+            # a 499 ("Client Closed Request") without noisy error logging — the
+            # response body will not reach the client anyway.
+            logger.info(f"Request aborted by client disconnect [request_id={request_id}]")
+            return JSONResponse(
+                content=create_error_response("Client closed request", "client_disconnect", 499),
+                status_code=499,
+            )
         except HTTPException:
             raise
         except Exception as e:
@@ -1057,7 +1072,10 @@ async def handle_stream_response(
 
 
 async def process_multimodal_request(
-    handler: MLXVLMHandler, request: ChatCompletionRequest, request_id: str | None = None
+    handler: MLXVLMHandler,
+    request: ChatCompletionRequest,
+    request_id: str | None = None,
+    raw_request: Request | None = None,
 ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
     """Process multimodal-specific requests."""
     if request_id:
@@ -1075,17 +1093,81 @@ async def process_multimodal_request(
                 "X-Accel-Buffering": "no",
             },
         )
-    result = await handler.generate_multimodal_response(request)
+    generation = handler.generate_multimodal_response(request)
+    if raw_request is not None:
+        result = await _await_with_disconnect_guard(raw_request, generation, request_id=request_id)
+    else:
+        result = await generation
     response_data = result.get("response")
     usage = result.get("usage")
     final_response = format_final_response(response_data, request.model, request_id, usage)
     return JSONResponse(content=final_response.model_dump(exclude_none=True))
 
 
+_T = TypeVar("_T")
+
+
+async def _await_with_disconnect_guard(
+    raw_request: Request,
+    awaitable: Awaitable[_T],
+    *,
+    request_id: str | None = None,
+    poll_interval: float = 0.5,
+) -> _T:
+    """Await a non-streaming generation, aborting it if the client disconnects.
+
+    Starlette only races the connection against a disconnect watcher for
+    *streaming* responses; a plain ``await handler.generate_*_response(...)``
+    keeps running on the server even after the client (for example an agent
+    that cancelled the request) has closed the socket. We poll
+    ``raw_request.is_disconnected()`` alongside the generation and cancel it on
+    disconnect, which propagates cancellation into the batch scheduler /
+    inference worker so generation actually stops.
+
+    Parameters
+    ----------
+    raw_request : Request
+        The live request, used to detect client disconnects.
+    awaitable : Awaitable[_T]
+        The generation coroutine to run.
+    request_id : str | None
+        Identifier used for logging.
+    poll_interval : float
+        Seconds between disconnect polls while awaiting the result.
+
+    Returns
+    -------
+    _T
+        The result of ``awaitable`` when it completes before any disconnect.
+
+    Raises
+    ------
+    ClientDisconnect
+        If the client closes the connection before generation finishes.
+    """
+    task: asyncio.Task[_T] = asyncio.ensure_future(awaitable)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll_interval)
+            if task in done:
+                return task.result()
+            if await raw_request.is_disconnected():
+                logger.info(
+                    f"Client disconnected; cancelling in-flight request [request_id={request_id}]"
+                )
+                raise ClientDisconnect
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
 async def process_text_request(
     handler: MLXLMHandler | MLXVLMHandler,
     request: ChatCompletionRequest,
     request_id: str | None = None,
+    raw_request: Request | None = None,
 ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
     """Process text-only requests."""
     if request_id:
@@ -1107,7 +1189,11 @@ async def process_text_request(
         )
 
     # Extract response and usage from handler
-    result = await handler.generate_text_response(request)  # type: ignore[union-attr]
+    generation = handler.generate_text_response(request)  # type: ignore[union-attr]
+    if raw_request is not None:
+        result = await _await_with_disconnect_guard(raw_request, generation, request_id=request_id)
+    else:
+        result = await generation
     response_data = result.get("response")
     usage = result.get("usage")
     final_response = format_final_response(response_data, request.model, request_id, usage)
