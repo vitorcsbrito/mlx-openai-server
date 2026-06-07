@@ -511,6 +511,10 @@ class MLX_LM:
             - ``checkpoint_callback`` (callable | None): Called with the
               prompt cache after processing the prefix so the caller can
               persist a checkpoint.
+            - ``checkpoints`` (list[tuple[int, callable]] | None): Multiple
+              ``(position, callback)`` checkpoints fired in ascending order
+              during a single prefill. Supersedes the single
+              ``checkpoint_position`` / ``checkpoint_callback`` pair.
 
         Returns
         -------
@@ -519,16 +523,35 @@ class MLX_LM:
         """
         checkpoint_position: int | None = kwargs.pop("checkpoint_position", None)
         checkpoint_callback = kwargs.pop("checkpoint_callback", None)
+        # Optional multi-checkpoint list: ``[(position, callback), ...]`` with
+        # positions relative to ``input_ids``. Generalizes the single
+        # checkpoint above so non-trimmable caches can snapshot state at every
+        # role boundary during one prefill pass.
+        checkpoints: list[tuple[int, Any]] | None = kwargs.pop("checkpoints", None)
 
+        # Normalize the single-checkpoint form into the list form so both
+        # follow one code path.
         if (
-            checkpoint_position is not None
+            checkpoints is None
+            and checkpoint_position is not None
             and checkpoint_callback is not None
-            and prompt_cache is not None
-            and 0 < checkpoint_position < len(input_ids)
         ):
-            self._prefill_cache(input_ids[:checkpoint_position], prompt_cache)
-            checkpoint_callback(prompt_cache)
-            input_ids = input_ids[checkpoint_position:]
+            checkpoints = [(checkpoint_position, checkpoint_callback)]
+
+        if checkpoints and prompt_cache is not None:
+            # Prefill segment-by-segment, firing each callback once its prefix
+            # has been processed. Positions must be ascending and strictly
+            # inside the prompt (the final token is always left for decoding).
+            valid = sorted((pos, cb) for pos, cb in checkpoints if 0 < pos < len(input_ids))
+            prev = 0
+            for pos, cb in valid:
+                if pos <= prev:
+                    continue
+                self._prefill_cache(input_ids[prev:pos], prompt_cache)
+                cb(prompt_cache)
+                prev = pos
+            if prev > 0:
+                input_ids = input_ids[prev:]
 
         def _get(key, default):
             v = kwargs.get(key)

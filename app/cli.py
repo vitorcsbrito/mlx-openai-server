@@ -283,6 +283,16 @@ def cli():
     ),
 )
 @click.option(
+    "--prompt-cache-auto-segment",
+    is_flag=True,
+    default=False,
+    help=(
+        "Auto-segment the prompt KV cache at role boundaries so multi-turn "
+        "and tool-heavy conversations can reuse cached prefixes mid-history. "
+        "Only works with language models (lm) and trimmable KV caches."
+    ),
+)
+@click.option(
     "--draft-model-path",
     default=None,
     type=str,
@@ -425,6 +435,7 @@ def launch(
     prompt_cache_size,
     prompt_cache_max_bytes,
     prompt_cache_dir,
+    prompt_cache_auto_segment,
     draft_model_path,
     num_draft_tokens,
     kv_bits,
@@ -501,6 +512,7 @@ def launch(
         prompt_cache_size=prompt_cache_size,
         prompt_cache_max_bytes=prompt_cache_max_bytes,
         prompt_cache_dir=prompt_cache_dir,
+        prompt_cache_auto_segment=prompt_cache_auto_segment,
         draft_model_path=draft_model_path,
         num_draft_tokens=num_draft_tokens,
         kv_bits=kv_bits,
