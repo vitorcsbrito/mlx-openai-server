@@ -90,6 +90,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.uv]
 prerelease = "allow"
+# This is an Apple-Silicon MLX server; only resolve/lock for macOS. Without
+# this, uv resolves for Linux too, where mflux pins mlx[cuda13]<=0.31.1 and
+# conflicts with our mlx>=0.31.2 requirement (an unsatisfiable, irrelevant env).
+environments = ["sys_platform == 'darwin'"]
 
 [tool.codespell]
 skip = "*.py,*.toml,*.ipynb"
