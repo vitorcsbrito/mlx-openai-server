@@ -227,6 +227,46 @@ def test_eviction_removes_sidecar(
     assert len(_sidecars(tmp_path)) == 1
 
 
+def test_close_preserves_payloads_for_configured_dir(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A clean shutdown must not wipe a caller-supplied cache directory."""
+    module = _load_prompt_cache_module(monkeypatch)
+
+    cache = module.LRUPromptCache(max_size=10, cache_dir=tmp_path, fingerprint="fp-A")
+    cache.insert_cache([1, 2, 3], [_FakeCacheLayer("kept")])
+
+    # Simulate the shutdown path (handler.cleanup -> prompt_cache.close()).
+    cache.close()
+
+    # Payload and sidecar survive on disk for the next run.
+    assert len(list(tmp_path.glob("*.pkl"))) == 1
+    assert len(_sidecars(tmp_path)) == 1
+
+    # And the next instance rehydrates and serves them.
+    revived = module.LRUPromptCache(max_size=10, cache_dir=tmp_path, fingerprint="fp-A")
+    result, rest = revived.fetch_nearest_cache([1, 2, 3])
+    assert rest == []
+    assert result is not None and result[0].value == "kept"
+
+
+def test_close_removes_owned_temp_dir(
+    monkeypatch: Any,
+) -> None:
+    """An auto-created temp directory is still removed on close."""
+    module = _load_prompt_cache_module(monkeypatch)
+
+    cache = module.LRUPromptCache(max_size=10)  # cache_dir omitted -> owned temp dir
+    cache.insert_cache([1], [_FakeCacheLayer("ephemeral")])
+    temp_dir = cache.cache_dir
+    assert temp_dir.exists()
+
+    cache.close()
+
+    assert not temp_dir.exists()
+
+
 def test_build_cache_fingerprint_is_config_sensitive(
     monkeypatch: Any,
 ) -> None:

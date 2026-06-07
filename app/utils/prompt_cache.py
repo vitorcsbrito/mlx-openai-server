@@ -711,11 +711,30 @@ class LRUPromptCache:
                 self._evict_tokens(self._lru.pop_from_type(cache_type))
         self._release_evicted_memory()
 
+    def _reset_in_memory_state(self) -> None:
+        """Drop the in-memory index without touching on-disk payloads."""
+        self._trie = PromptTrie()
+        self._lru = self.CacheOrder()
+        self._n_bytes = 0
+        self._n_bytes_by_type = dict.fromkeys(self._lru.ordering, 0)
+
     def close(self) -> None:
-        """Clear entries and remove the owned temporary cache directory."""
-        self.clear()
+        """Release the cache, preserving a caller-supplied directory's payloads.
+
+        For a process-local temporary directory (created when ``cache_dir`` was
+        omitted), the serialized payloads and the directory itself are removed.
+        For a caller-supplied directory the on-disk payloads and sidecars are
+        left in place so they can be rehydrated on the next run; only the
+        in-memory index is dropped. This is what makes a configured
+        ``prompt_cache_dir`` survive a restart rather than being wiped on
+        shutdown.
+        """
         if self._owns_cache_dir:
+            self.clear()
             shutil.rmtree(self.cache_dir, ignore_errors=True)
+        else:
+            self._reset_in_memory_state()
+        self._release_evicted_memory()
 
     def stats_by_type(self) -> dict[str, dict[str, int]]:
         """Return per-type sequence count and byte usage."""
