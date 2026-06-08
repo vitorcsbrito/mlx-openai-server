@@ -156,6 +156,41 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
     cached_tokens: int | None = None
 
 
+class CompletionTimingsInfo(OpenAIBaseModel):
+    """Per-request throughput timings, in tokens per second.
+
+    Non-standard additive field. Values are populated on the final
+    response (non-streaming) or final usage chunk (streaming); they are
+    ``None`` when the handler did not report timing data.
+    """
+
+    prompt_tps: float | None = None
+    generation_tps: float | None = None
+
+    @classmethod
+    def from_stats(cls, source: Any) -> CompletionTimingsInfo:
+        """Build timings from a generation result or batch chunk.
+
+        Parameters
+        ----------
+        source : Any
+            Object exposing ``prompt_tps`` and/or ``generation_tps`` floats
+            (e.g. ``mlx_lm`` ``GenerationResponse`` or ``BatchChunk``).
+            Missing or zero values are reported as ``None``.
+
+        Returns
+        -------
+        CompletionTimingsInfo
+            Timings with throughput rounded to two decimal places.
+        """
+        prompt_tps = getattr(source, "prompt_tps", None)
+        generation_tps = getattr(source, "generation_tps", None)
+        return cls(
+            prompt_tps=round(prompt_tps, 2) if prompt_tps else None,
+            generation_tps=round(generation_tps, 2) if generation_tps else None,
+        )
+
+
 class StreamOptions(OpenAIBaseModel):
     """Stream options for a request."""
 
@@ -170,6 +205,7 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    timings: CompletionTimingsInfo | None = None
 
 
 class FunctionCall(OpenAIBaseModel):

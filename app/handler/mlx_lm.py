@@ -15,7 +15,12 @@ from ..core import BatchScheduler, InferenceWorker
 from ..core.batch_scheduler import BATCHING_AVAILABLE
 from ..message_converters import MessageConverterManager
 from ..parsers import ParserManager, ReasoningParserState, ToolParserState
-from ..schemas.openai import ChatCompletionRequest, PromptTokenUsageInfo, UsageInfo
+from ..schemas.openai import (
+    ChatCompletionRequest,
+    CompletionTimingsInfo,
+    PromptTokenUsageInfo,
+    UsageInfo,
+)
 from ..utils.debug_logging import (
     log_debug_cache_stats,
     log_debug_model_dispatch,
@@ -1424,6 +1429,7 @@ class MLXLMHandler:
                     prompt_tokens_details=PromptTokenUsageInfo(
                         cached_tokens=_coerce_cached_tokens(total_cached_tokens, final_chunk)
                     ),
+                    timings=CompletionTimingsInfo.from_stats(final_chunk),
                 )
             }
 
@@ -1605,6 +1611,7 @@ class MLXLMHandler:
                 prompt_tokens_details=PromptTokenUsageInfo(
                     cached_tokens=_coerce_cached_tokens(total_cached_tokens, response)
                 ),
+                timings=CompletionTimingsInfo.from_stats(response),
             )
 
             return {"response": parsed_response, "usage": usage}

@@ -19,6 +19,7 @@ from ..schemas.openai import (
     ChatCompletionContentPartInputAudio,
     ChatCompletionContentPartVideo,
     ChatCompletionRequest,
+    CompletionTimingsInfo,
     UsageInfo,
 )
 from ..utils.debug_logging import (
@@ -611,6 +612,7 @@ class MLXVLMHandler:
                     prompt_tokens=final_chunk.prompt_tokens,
                     completion_tokens=final_chunk.generation_tokens,
                     total_tokens=total_tokens,
+                    timings=CompletionTimingsInfo.from_stats(final_chunk),
                 )
             }
 
@@ -748,6 +750,7 @@ class MLXVLMHandler:
                 prompt_tokens=response.prompt_tokens,
                 completion_tokens=response.generation_tokens,
                 total_tokens=total_tokens,
+                timings=CompletionTimingsInfo.from_stats(response),
             )
 
             return {"response": parsed_response, "usage": usage}
