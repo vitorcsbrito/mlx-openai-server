@@ -1877,6 +1877,7 @@ class MLXLMHandler:
 
         generation_tokens = final_chunk.generation_tokens if final_chunk else len(tokens)
         generation_tps = final_chunk.generation_tps if final_chunk else 0.0
+        prompt_tps = final_chunk.prompt_tps if final_chunk else 0.0
         peak_memory = final_chunk.peak_memory if final_chunk else 0.0
         prompt_tokens = final_chunk.prompt_tokens if final_chunk else len(ctx.rest_input_ids)
         cached_prompt_tokens = final_chunk.cached_prompt_tokens if final_chunk else 0
@@ -1885,7 +1886,7 @@ class MLXLMHandler:
             tokens=tokens,
             peak_memory=peak_memory,
             generation_tps=generation_tps,
-            prompt_tps=0.0,
+            prompt_tps=prompt_tps,
             prompt_tokens=prompt_tokens,
             generation_tokens=generation_tokens,
             cached_prompt_tokens=cached_prompt_tokens,
