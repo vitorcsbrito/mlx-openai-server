@@ -79,6 +79,7 @@ mlx-openai-server launch --model-path mlx-community/SomeModel-4bit --model-type 
 | `--prompt-cache-size` | `10` | int |
 | `--max-bytes` | `2^63` | int (→ field `prompt_cache_max_bytes`) |
 | `--prompt-cache-dir` | temp dir | path |
+| `--prompt-cache-auto-segment` | `false` | flag (→ field `prompt_cache_auto_segment`) |
 
 A process-local temp dir (the default) is removed on shutdown. A
 caller-supplied `--prompt-cache-dir` instead persists across restarts: on
@@ -87,6 +88,12 @@ survive a restart. Adoption is gated by a fingerprint of the model path and
 KV-cache settings (`--kv-bits`, `--kv-group-size`, `--quantized-kv-start`) plus
 the MLX version — entries built under a different configuration are skipped and
 cleaned up rather than reused.
+
+`--prompt-cache-auto-segment` checkpoints the cache at role boundaries so
+conversations sharing only an earlier span (e.g. the system prompt) can reuse it
+mid-history. Full behavior — persistence layout, fingerprinting, rehydration,
+directory ownership, and auto-segmentation — is documented in
+[prompt-cache.md](./prompt-cache.md).
 
 ### KV cache quantization (`lm` / `multimodal` only)
 

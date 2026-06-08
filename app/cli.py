@@ -289,7 +289,8 @@ def cli():
     help=(
         "Auto-segment the prompt KV cache at role boundaries so multi-turn "
         "and tool-heavy conversations can reuse cached prefixes mid-history. "
-        "Only works with language models (lm) and trimmable KV caches."
+        "Only works with language models (lm); supports both trimmable and "
+        "non-trimmable (hybrid SSM, e.g. Qwen3.5) KV caches."
     ),
 )
 @click.option(

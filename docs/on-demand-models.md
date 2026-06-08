@@ -19,11 +19,11 @@ models:
     queue_timeout: 600             # per-request wall-clock timeout
 ```
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `on_demand` | `false` | Enable lazy load + idle unload for this entry. |
-| `on_demand_idle_timeout` | `60` | Seconds the model may sit **idle** before it is unloaded. |
-| `queue_timeout` | `300` | Unrelated knob: the wall-clock timeout for a single request. |
+| Key                      | Default | Meaning                                                      |
+|--------------------------|---------|--------------------------------------------------------------|
+| `on_demand`              | `false` | Enable lazy load + idle unload for this entry.               |
+| `on_demand_idle_timeout` | `60`    | Seconds the model may sit **idle** before it is unloaded.    |
+| `queue_timeout`          | `300`   | Unrelated knob: the wall-clock timeout for a single request. |
 
 > **`on_demand_idle_timeout` and `queue_timeout` are independent.** One bounds
 > how long an *idle* model stays resident; the other bounds how long a *running*
@@ -58,10 +58,10 @@ running at all.
 
 ### When "release" happens depends on the response type
 
-| Response type | Release point | Idle timer starts… |
-|---------------|---------------|--------------------|
-| Non-streaming | endpoint `finally`, after the generation `await` returns (`app/api/endpoints.py:644`) | when generation is fully complete |
-| Streaming | deferred: the wrapped response body releases when the stream is exhausted, closed, or errors (`_attach_on_demand_release`, `app/api/endpoints.py`) | when the last chunk has been sent |
+| Response type | Release point                                                                                                                                      | Idle timer starts…                |
+|---------------|----------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------|
+| Non-streaming | endpoint `finally`, after the generation `await` returns (`app/api/endpoints.py:644`)                                                              | when generation is fully complete |
+| Streaming     | deferred: the wrapped response body releases when the stream is exhausted, closed, or errors (`_attach_on_demand_release`, `app/api/endpoints.py`) | when the last chunk has been sent |
 
 A `StreamingResponse` is returned from the endpoint *before* any token is
 generated. The release is therefore deferred until the body iterator is fully
@@ -139,15 +139,35 @@ release immediately in the endpoint `finally`, which is correct because the
 
 ---
 
-## Only one on-demand model resident at a time
+## How many on-demand models stay resident?
 
-Loading an on-demand model evicts **idle** on-demand models to free memory
+There is **no hard limit of one** — the system *converges* to a single resident
+on-demand model, but it never evicts one that is busy. More than one on-demand
+model can be loaded at the same time.
+
+Loading a **not-yet-resident** on-demand model sweeps the other loaded
+on-demand models, but **only evicts the idle ones** (ref count == 0)
 (`ensure_on_demand_loaded`, `app/core/model_registry.py:373`). An on-demand
-model that still has in-flight requests (ref count > 0) is **not** evicted — it
-is kept loaded alongside the newly requested one until its own requests drain.
-Always-on (non-`on_demand`) models are never evicted by this path.
+model that still has in-flight requests (ref count > 0) is **kept loaded
+alongside** the newly requested one until its own requests drain (you'll see a
+`keeping loaded alongside` log line). Always-on (non-`on_demand`) models are
+never touched by this path.
 
-Loads are serialized by a lock, so concurrent first-hits for the same model
+So if model **A** is busy serving a request when a request for model **B**
+arrives, **both A and B are resident** simultaneously. Two mechanisms then pull
+the count back down to one, neither of which preempts active work:
+
+1. **Lazy eviction on load** — the next load of a *different* on-demand model
+   evicts whichever peers are idle at that moment.
+2. **Per-model idle timer** — each model has its own `on_demand_idle_timeout`;
+   once its requests drain it schedules its own unload (see
+   [the idle-timer section](#when-does-the-idle-timer-start)).
+
+Two *idle* on-demand models can therefore coexist briefly (A was busy when B
+loaded, then A finished), but they do not persist — each is cleared by its own
+idle timer, or by the next load that sweeps idle peers.
+
+Loads are serialized by a lock, so concurrent first-hits for the **same** model
 load it once and then share the single resident handler.
 
 ---
@@ -158,7 +178,8 @@ Idle unload routes through `handler.cleanup()`. When a model is configured with
 a persistent `prompt_cache_dir`, that cleanup **preserves** the on-disk
 payloads (only the in-memory index is dropped), so a model that is unloaded by
 the idle timer and later reloaded rehydrates its prompt KV cache from disk
-rather than starting cold. See the prompt-cache persistence notes for the
+rather than starting cold. See
+[prompt-cache.md](./prompt-cache.md#directory-ownership-and-close) for the
 ownership rules. An auto-created temp cache directory is still removed on
 unload.
 
@@ -166,11 +187,11 @@ unload.
 
 ## Source map
 
-| Behavior | Location |
-|----------|----------|
-| Acquire + cancel timer + load | `app/core/model_registry.py:333` (`ensure_on_demand_loaded`) |
-| Evict idle peers / keep in-flight | `app/core/model_registry.py:373` |
-| Release + schedule idle timer | `app/core/model_registry.py:418` (`release_on_demand`) |
-| Idle sleep + re-check + unload | `app/core/model_registry.py:447` (`_idle_unload`) |
-| Request acquire | `app/api/endpoints.py:146` (`_resolve_handler`) |
-| Deferred streaming release | `app/api/endpoints.py:185` (`_release_on_demand`, `_attach_on_demand_release`) |
+| Behavior                          | Location                                                                       |
+|-----------------------------------|--------------------------------------------------------------------------------|
+| Acquire + cancel timer + load     | `app/core/model_registry.py:333` (`ensure_on_demand_loaded`)                   |
+| Evict idle peers / keep in-flight | `app/core/model_registry.py:373`                                               |
+| Release + schedule idle timer     | `app/core/model_registry.py:418` (`release_on_demand`)                         |
+| Idle sleep + re-check + unload    | `app/core/model_registry.py:447` (`_idle_unload`)                              |
+| Request acquire                   | `app/api/endpoints.py:146` (`_resolve_handler`)                                |
+| Deferred streaming release        | `app/api/endpoints.py:185` (`_release_on_demand`, `_attach_on_demand_release`) |

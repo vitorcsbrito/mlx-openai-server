@@ -333,9 +333,13 @@ class ModelRegistry:
     async def ensure_on_demand_loaded(self, model_id: str) -> Any:
         """Load an on-demand model if not already loaded.
 
-        If a different on-demand model is currently loaded and idle,
-        it will be unloaded first.  Only one on-demand model is kept
-        in memory at a time.
+        Loading a not-yet-resident on-demand model evicts other on-demand
+        models that are currently idle (``ref_count == 0``) to free memory.
+        On-demand peers that still have in-flight requests are kept loaded
+        alongside the new one until their own requests drain, so more than
+        one on-demand model can be resident at a time; the set converges back
+        to one as idle peers are evicted on the next load or by their own
+        idle-unload timers. Always-on models are never evicted by this path.
 
         Parameters
         ----------
