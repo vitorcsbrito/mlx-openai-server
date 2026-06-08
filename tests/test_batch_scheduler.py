@@ -378,6 +378,56 @@ async def test_stop_closes_batch_generator(patched_scheduler):
     assert fake.closed is True
 
 
+def _make_active_request(patched_scheduler, **overrides: Any):
+    """Construct a minimal ``_ActiveRequest`` for timing-helper tests."""
+    fields = {
+        "loop": None,
+        "out_queue": None,
+        "detokenizer": None,
+        "cancel_event": threading.Event(),
+        "prompt_tokens": 0,
+        "cached_prompt_tokens": 0,
+        "pending_segment_types": [],
+    }
+    fields.update(overrides)
+    return patched_scheduler._ActiveRequest(**fields)
+
+
+def test_compute_prompt_tps_over_processed_tokens(patched_scheduler):
+    """prompt_tps divides prefilled (non-cached) tokens by the prefill interval."""
+    state = _make_active_request(
+        patched_scheduler,
+        prompt_tokens=100,
+        cached_prompt_tokens=20,
+        prefill_start_time=10.0,
+        first_token_time=10.4,  # 0.4s prefill -> 80 tokens / 0.4s = 200 tps
+    )
+    assert patched_scheduler.BatchScheduler._compute_prompt_tps(state) == pytest.approx(200.0)
+
+
+def test_compute_prompt_tps_full_cache_hit_is_zero(patched_scheduler):
+    """A full cache hit (nothing prefilled) reports 0.0, not a divide error."""
+    state = _make_active_request(
+        patched_scheduler,
+        prompt_tokens=50,
+        cached_prompt_tokens=50,
+        prefill_start_time=10.0,
+        first_token_time=10.2,
+    )
+    assert patched_scheduler.BatchScheduler._compute_prompt_tps(state) == 0.0
+
+
+def test_compute_prompt_tps_missing_timing_is_zero(patched_scheduler):
+    """No first-token timestamp yet -> 0.0."""
+    state = _make_active_request(
+        patched_scheduler,
+        prompt_tokens=10,
+        prefill_start_time=10.0,
+        first_token_time=None,
+    )
+    assert patched_scheduler.BatchScheduler._compute_prompt_tps(state) == 0.0
+
+
 def test_default_state_machine_builds_with_eos(patched_scheduler):
     """EOS tokens from the tokenizer should be wired into the default state machine."""
     tok = FakeTokenizer(eos_token_ids=[2, 3])
