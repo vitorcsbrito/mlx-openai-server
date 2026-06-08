@@ -183,12 +183,75 @@ async def _resolve_handler(
 
 
 async def _release_on_demand(raw_request: Request) -> None:
-    """Release the on-demand model reference after a request completes."""
+    """Release the on-demand model reference after a request completes.
+
+    For streaming responses the release is deferred to the end of the stream
+    by :func:`_attach_on_demand_release`; in that case this is a no-op so the
+    reference is not dropped while tokens are still being generated.
+    """
+    if getattr(raw_request.state, "on_demand_release_deferred", False):
+        return
     model_id = getattr(raw_request.state, "on_demand_model_id", None)
     if model_id is not None:
         registry = getattr(raw_request.app.state, "registry", None)
         if registry is not None:
             await registry.release_on_demand(model_id)
+
+
+ResponseT = TypeVar("ResponseT")
+
+
+def _attach_on_demand_release(raw_request: Request, response: ResponseT) -> ResponseT:
+    """Defer the on-demand release until a streaming response is fully sent.
+
+    A :class:`~fastapi.responses.StreamingResponse` is returned from the
+    endpoint *before* its body iterator has produced any tokens, so the
+    endpoint's ``finally`` block would otherwise release the on-demand
+    reference immediately and start the idle-unload timer while generation is
+    still in progress.  For streaming responses this wraps the body iterator so
+    the reference is only released once the stream has been fully consumed (or
+    the client disconnects / errors), keeping the model loaded for the lifetime
+    of the request.
+
+    Non-streaming responses are returned unchanged; the caller's ``finally``
+    releases them immediately.
+
+    Parameters
+    ----------
+    raw_request : Request
+        The incoming request, tagged with ``on_demand_model_id`` when the
+        handler was loaded on demand.
+    response : ResponseT
+        The response about to be returned from the endpoint.
+
+    Returns
+    -------
+    ResponseT
+        The same response object, with its body iterator wrapped when it is a
+        streaming response backed by an on-demand model.
+    """
+    model_id = getattr(raw_request.state, "on_demand_model_id", None)
+    if model_id is None or not isinstance(response, StreamingResponse):
+        return response
+
+    registry = getattr(raw_request.app.state, "registry", None)
+    if registry is None:
+        return response
+
+    # Suppress the endpoint's immediate ``finally`` release; the wrapper below
+    # owns the release once the stream is exhausted.
+    raw_request.state.on_demand_release_deferred = True
+    original_iterator = response.body_iterator
+
+    async def _release_after_stream() -> AsyncGenerator[Any, None]:
+        try:
+            async for chunk in original_iterator:
+                yield chunk
+        finally:
+            await registry.release_on_demand(model_id)
+
+    response.body_iterator = _release_after_stream()
+    return response
 
 
 def _get_handler_registry_ownership(raw_request: Request, handler: Any) -> str:
@@ -619,10 +682,14 @@ async def chat_completions(
 
         try:
             if handler_type == "multimodal":
-                return await process_multimodal_request(
+                response = await process_multimodal_request(
                     handler, request, request_id, raw_request=raw_request
                 )
-            return await process_text_request(handler, request, request_id, raw_request=raw_request)
+            else:
+                response = await process_text_request(
+                    handler, request, request_id, raw_request=raw_request
+                )
+            return _attach_on_demand_release(raw_request, response)
         except ClientDisconnect:
             # The client (e.g. an agent cancelling the request) closed the
             # connection; generation was already cancelled in the guard. Return
@@ -797,14 +864,17 @@ async def create_audio_transcriptions(
         if request.stream:
             # procoess the request before sending to the handler
             request_data = await handler.prepare_transcription_request(request)
-            return StreamingResponse(
-                handler.generate_transcription_stream_from_data(request_data),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
+            return _attach_on_demand_release(
+                raw_request,
+                StreamingResponse(
+                    handler.generate_transcription_stream_from_data(request_data),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                ),
             )
         transcription_response: (
             TranscriptionResponse | str
@@ -2214,8 +2284,10 @@ async def responses_endpoint(
 
         try:
             if handler_type == "multimodal":
-                return await process_multimodal_responses_request(handler, request)
-            return await process_text_responses_request(handler, request)
+                response = await process_multimodal_responses_request(handler, request)
+            else:
+                response = await process_text_responses_request(handler, request)
+            return _attach_on_demand_release(raw_request, response)
         except HTTPException:
             raise
         except Exception as e:
