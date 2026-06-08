@@ -189,8 +189,8 @@ field.
 | `config_name` | type-dependent | Image models. |
 | `lora_paths` | none | **YAML list** of strings (not comma string). |
 | `lora_scales` | none | **YAML list** of floats. |
-| `on_demand` | `false` | **YAML-only.** Lazy-load + idle-unload this model. |
-| `on_demand_idle_timeout` | `60` | **YAML-only.** Seconds idle before unloading. |
+| `on_demand` | `false` | **YAML-only.** Lazy-load + idle-unload this model. See [on-demand-models.md](./on-demand-models.md). |
+| `on_demand_idle_timeout` | `60` | **YAML-only.** Seconds **idle** before unloading. The idle timer starts only when the last in-flight request finishes — independent of `queue_timeout`. See [on-demand-models.md](./on-demand-models.md). |
 | `disable_auto_resize` | `false` | VLMs. |
 | `enable_auto_tool_choice` | `false` | |
 | `tool_call_parser` | none | |
@@ -274,6 +274,12 @@ models:
   `on_demand_idle_timeout`, `message_converter`.
 - **Single-model-only**: there is no on-demand/idle-unload in single-model mode;
   use a one-entry `--config` YAML if you need it.
+- **`on_demand_idle_timeout` ≠ `queue_timeout`.** The idle timeout bounds how
+  long an *idle* model stays resident and only starts counting once the last
+  in-flight request completes; `queue_timeout` bounds a *running* request. A
+  short idle timeout does not unload a model while a request is still in flight.
+  Full lifecycle (single vs concurrent requests, streaming) in
+  [on-demand-models.md](./on-demand-models.md).
 
 ### Valid `model_type` values
 
