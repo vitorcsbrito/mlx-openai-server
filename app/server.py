@@ -490,6 +490,9 @@ def create_multi_lifespan(config: MultiModelServerConfig):
                     handler=proxy,
                     model_type=model_cfg.model_type,
                     context_length=model_cfg.context_length,
+                    enable_auto_tool_choice=model_cfg.enable_auto_tool_choice,
+                    tool_call_parser=model_cfg.tool_call_parser,
+                    reasoning_parser=model_cfg.reasoning_parser,
                 )
                 logger.info(f"Model '{model_id}' spawned and registered successfully")
 
