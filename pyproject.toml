@@ -49,6 +49,7 @@ dependencies = [
   "mflux>=0.17.4,<0.18",
   "uvicorn>=0.35.0,<0.40",
   "xxhash>=3.6,<4",
+  "transformers==5.3.0"
 ]
 
 [dependency-groups]
