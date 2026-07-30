@@ -1,0 +1,28 @@
+# mlx-openai-server config for MacBook Pro (16GB unified memory).
+#
+# Launch with:
+#   mlx-openai-server launch --config ./mlx-config/config.yaml
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  log_level: DEBUG
+  log_file: ./logs/app.log
+
+models:
+  - model_path: /Users/vitorbrito/models/Qwen3.6-35B-A3B-Fable-5-Distill-mlx-8bit
+    served_model_name: Qwen3.6
+    model_type: multimodal
+    enable_auto_tool_choice: true
+    reasoning_parser: qwen3_5
+    tool_call_parser: qwen3_coder
+    context_length: 80000
+    debug: false
+    prompt_cache_size: 20
+    prompt_cache_dir: ./prompt_cache
+    prompt_cache_auto_segment: true
+    queue_timeout: 600
+    queue_size: 10
+    batch_prefill_step_size: 2048
+    on_demand: false
+    on_demand_idle_timeout: 600
