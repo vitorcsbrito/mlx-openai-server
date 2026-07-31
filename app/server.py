@@ -65,6 +65,8 @@ _SAMPLING_DEFAULT_FIELDS: tuple[str, ...] = (
     "default_xtc_threshold",
     "default_seed",
     "default_repetition_context_size",
+    "default_presence_context_size",
+    "default_frequency_context_size",
 )
 
 

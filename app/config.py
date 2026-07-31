@@ -86,6 +86,8 @@ class MLXServerConfig:
     default_xtc_threshold: float | None = None
     default_seed: int | None = None
     default_repetition_context_size: int | None = None
+    default_presence_context_size: int | None = None
+    default_frequency_context_size: int | None = None
 
     # Used to capture raw CLI input before processing
     lora_paths_str: str | None = None
@@ -224,6 +226,8 @@ class MLXServerConfig:
             default_xtc_threshold=self.default_xtc_threshold,
             default_seed=self.default_seed,
             default_repetition_context_size=self.default_repetition_context_size,
+            default_presence_context_size=self.default_presence_context_size,
+            default_frequency_context_size=self.default_frequency_context_size,
         )
 
     def to_multi_model_server_config(self) -> MultiModelServerConfig:
@@ -322,6 +326,8 @@ class ModelEntryConfig:
     default_xtc_threshold: float | None = None
     default_seed: int | None = None
     default_repetition_context_size: int | None = None
+    default_presence_context_size: int | None = None
+    default_frequency_context_size: int | None = None
 
     def __post_init__(self) -> None:
         """Resolve ``served_model_name`` and validate ``model_type``."""

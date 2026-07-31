@@ -409,6 +409,18 @@ def cli():
     type=int,
     help="Default repetition context size parameter.",
 )
+@click.option(
+    "--presence-context-size",
+    default=None,
+    type=int,
+    help="Default number of previous tokens the presence penalty considers.",
+)
+@click.option(
+    "--frequency-context-size",
+    default=None,
+    type=int,
+    help="Default number of previous tokens the frequency penalty considers.",
+)
 def launch(
     config_file,
     model_path,
@@ -457,6 +469,8 @@ def launch(
     xtc_threshold,
     seed,
     repetition_context_size,
+    presence_context_size,
+    frequency_context_size,
 ) -> None:
     """Start the FastAPI/Uvicorn server with the supplied flags.
 
@@ -534,6 +548,8 @@ def launch(
         default_xtc_threshold=xtc_threshold,
         default_seed=seed,
         default_repetition_context_size=repetition_context_size,
+        default_presence_context_size=presence_context_size,
+        default_frequency_context_size=frequency_context_size,
     )
 
     # Single-model launches always run through the HandlerProcessProxy

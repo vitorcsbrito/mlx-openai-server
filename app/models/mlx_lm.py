@@ -30,6 +30,10 @@ DEFAULT_REPETITION_PENALTY = float(os.getenv("DEFAULT_REPETITION_PENALTY", "0.0"
 DEFAULT_REPETITION_CONTEXT_SIZE = int(os.getenv("DEFAULT_REPETITION_CONTEXT_SIZE", "20"))
 DEFAULT_PRESENCE_PENALTY = float(os.getenv("DEFAULT_PRESENCE_PENALTY", "0.0"))
 DEFAULT_FREQUENCY_PENALTY = float(os.getenv("DEFAULT_FREQUENCY_PENALTY", "0.0"))
+# Every penalty only inspects the last N tokens, so a window under one loop
+# cycle cannot see paragraph-scale repetition. mlx_lm's own default is 20.
+DEFAULT_PRESENCE_CONTEXT_SIZE = int(os.getenv("DEFAULT_PRESENCE_CONTEXT_SIZE", "20"))
+DEFAULT_FREQUENCY_CONTEXT_SIZE = int(os.getenv("DEFAULT_FREQUENCY_CONTEXT_SIZE", "20"))
 
 
 def _as_int_set(values: Any) -> set[int]:
@@ -359,7 +363,11 @@ class MLX_LM:
                 "repetition_context_size", DEFAULT_REPETITION_CONTEXT_SIZE
             ),
             "presence_penalty": _get("presence_penalty", DEFAULT_PRESENCE_PENALTY),
+            "presence_context_size": _get("presence_context_size", DEFAULT_PRESENCE_CONTEXT_SIZE),
             "frequency_penalty": _get("frequency_penalty", DEFAULT_FREQUENCY_PENALTY),
+            "frequency_context_size": _get(
+                "frequency_context_size", DEFAULT_FREQUENCY_CONTEXT_SIZE
+            ),
             "xtc_probability": _get("xtc_probability", DEFAULT_XTC_PROBABILITY),
             "xtc_threshold": _get("xtc_threshold", DEFAULT_XTC_THRESHOLD),
             "eos_token_ids": sorted(_as_int_set(getattr(self.tokenizer, "eos_token_ids", None))),
@@ -423,9 +431,21 @@ class MLX_LM:
         repetition_penalty = _penalty_value("repetition_penalty", DEFAULT_REPETITION_PENALTY)
         presence_penalty = _penalty_value("presence_penalty", DEFAULT_PRESENCE_PENALTY)
         frequency_penalty = _penalty_value("frequency_penalty", DEFAULT_FREQUENCY_PENALTY)
-        repetition_context_size = params.get("repetition_context_size")
-        if repetition_context_size is None:
-            repetition_context_size = DEFAULT_REPETITION_CONTEXT_SIZE
+        def _context_size(key: str, default: int) -> int:
+            value = params.get(key)
+            if value is None:
+                value = self._sampling_default(key, default)
+            return default if value is None else value
+
+        repetition_context_size = _context_size(
+            "repetition_context_size", DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        presence_context_size = _context_size(
+            "presence_context_size", DEFAULT_PRESENCE_CONTEXT_SIZE
+        )
+        frequency_context_size = _context_size(
+            "frequency_context_size", DEFAULT_FREQUENCY_CONTEXT_SIZE
+        )
 
         processors: list[Any] = list(
             make_logits_processors(
@@ -433,7 +453,9 @@ class MLX_LM:
                 repetition_penalty=repetition_penalty,
                 repetition_context_size=repetition_context_size,
                 presence_penalty=presence_penalty,
+                presence_context_size=presence_context_size,
                 frequency_penalty=frequency_penalty,
+                frequency_context_size=frequency_context_size,
             )
         )
 
@@ -585,6 +607,8 @@ class MLX_LM:
         if frequency_penalty == 0:
             frequency_penalty = None
         repetition_context_size = _get("repetition_context_size", DEFAULT_REPETITION_CONTEXT_SIZE)
+        presence_context_size = _get("presence_context_size", DEFAULT_PRESENCE_CONTEXT_SIZE)
+        frequency_context_size = _get("frequency_context_size", DEFAULT_FREQUENCY_CONTEXT_SIZE)
         logit_bias = kwargs.get("logit_bias")
 
         # Convert string keys to int if logit_bias is provided (OpenAI API uses string keys)
@@ -596,7 +620,9 @@ class MLX_LM:
             repetition_penalty=repetition_penalty,
             repetition_context_size=repetition_context_size,
             presence_penalty=presence_penalty,
+            presence_context_size=presence_context_size,
             frequency_penalty=frequency_penalty,
+            frequency_context_size=frequency_context_size,
         )
 
         json_schema = kwargs.get("schema")

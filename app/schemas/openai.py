@@ -335,6 +335,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     repetition_context_size: int | None = Field(
         None, description="Repetition context size for token generation."
     )
+    presence_context_size: int | None = Field(
+        None, description="Number of previous tokens the presence penalty considers."
+    )
+    frequency_context_size: int | None = Field(
+        None, description="Number of previous tokens the frequency penalty considers."
+    )
     xtc_probability: float | None = Field(
         None, description="XTC (eXclude Top Choices) sampling probability (0.0-1.0)."
     )

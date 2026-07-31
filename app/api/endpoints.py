@@ -625,6 +625,20 @@ def refine_chat_completion_request(
             "DEFAULT_REPETITION_CONTEXT_SIZE",
             _parse_env_int,
         )
+    if request.presence_context_size is None:
+        request.presence_context_size = _get_sampling_default(
+            handler,
+            "default_presence_context_size",
+            "DEFAULT_PRESENCE_CONTEXT_SIZE",
+            _parse_env_int,
+        )
+    if request.frequency_context_size is None:
+        request.frequency_context_size = _get_sampling_default(
+            handler,
+            "default_frequency_context_size",
+            "DEFAULT_FREQUENCY_CONTEXT_SIZE",
+            _parse_env_int,
+        )
     if not request.model:
         request.model = Config.TEXT_MODEL
     return request

@@ -250,6 +250,10 @@ def _apply_sampling_env(config: MLXServerConfig) -> None:
         os.environ["DEFAULT_SEED"] = str(config.default_seed)
     if config.default_repetition_context_size is not None:
         os.environ["DEFAULT_REPETITION_CONTEXT_SIZE"] = str(config.default_repetition_context_size)
+    if config.default_presence_context_size is not None:
+        os.environ["DEFAULT_PRESENCE_CONTEXT_SIZE"] = str(config.default_presence_context_size)
+    if config.default_frequency_context_size is not None:
+        os.environ["DEFAULT_FREQUENCY_CONTEXT_SIZE"] = str(config.default_frequency_context_size)
 
 
 async def start(config: MLXServerConfig) -> None:
