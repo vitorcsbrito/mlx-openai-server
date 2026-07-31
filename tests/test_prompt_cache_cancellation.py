@@ -166,6 +166,10 @@ async def test_prompt_cache_inserted_on_normal_completion(
         if token == 6:
             chunk.prompt_tokens = 10
             chunk.generation_tokens = 20
+            # Floats, not the auto-created child Mocks: the final chunk reaches
+            # CompletionTimingsInfo.from_stats, which rounds these.
+            chunk.prompt_tps = 123.456
+            chunk.generation_tps = 42.019
         chunks.append(chunk)
     mock_model.side_effect = lambda *_args, **_kwargs: iter(chunks)
 
@@ -201,12 +205,21 @@ async def test_prompt_cache_inserted_on_normal_completion(
     with patch("app.handler.mlx_lm.ParserManager.create_parsers", return_value=mock_parsers_result):
         fake_request = Mock()
         gen = handler.generate_text_stream(fake_request)
+        emitted = []
         try:
-            async for _ in gen:
-                pass
+            emitted.extend([item async for item in gen])
         finally:
             await gen.aclose()
             await asyncio.sleep(0)
+
+        # Guards the fixture: a chunk without float tps fields hands from_stats
+        # an auto-created Mock and the whole stream dies in round().
+        usage = [
+            item["__usage__"] for item in emitted if isinstance(item, dict) and "__usage__" in item
+        ]
+        assert usage, "stream ended without a final usage chunk"
+        assert usage[-1].timings.prompt_tps == 123.46
+        assert usage[-1].timings.generation_tps == 42.02
 
         mock_prompt_cache.insert_cache.assert_called_once()
         call_args = mock_prompt_cache.insert_cache.call_args
