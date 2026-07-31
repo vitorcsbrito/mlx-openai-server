@@ -82,6 +82,7 @@ class MLXServerConfig:
     default_min_p: float | None = None
     default_repetition_penalty: float | None = None
     default_presence_penalty: float | None = None
+    default_frequency_penalty: float | None = None
     default_xtc_probability: float | None = None
     default_xtc_threshold: float | None = None
     default_seed: int | None = None
@@ -222,6 +223,7 @@ class MLXServerConfig:
             default_min_p=self.default_min_p,
             default_repetition_penalty=self.default_repetition_penalty,
             default_presence_penalty=self.default_presence_penalty,
+            default_frequency_penalty=self.default_frequency_penalty,
             default_xtc_probability=self.default_xtc_probability,
             default_xtc_threshold=self.default_xtc_threshold,
             default_seed=self.default_seed,
@@ -322,6 +324,7 @@ class ModelEntryConfig:
     default_min_p: float | None = None
     default_repetition_penalty: float | None = None
     default_presence_penalty: float | None = None
+    default_frequency_penalty: float | None = None
     default_xtc_probability: float | None = None
     default_xtc_threshold: float | None = None
     default_seed: int | None = None

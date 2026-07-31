@@ -242,6 +242,8 @@ def _apply_sampling_env(config: MLXServerConfig) -> None:
         os.environ["DEFAULT_REPETITION_PENALTY"] = str(config.default_repetition_penalty)
     if config.default_presence_penalty is not None:
         os.environ["DEFAULT_PRESENCE_PENALTY"] = str(config.default_presence_penalty)
+    if config.default_frequency_penalty is not None:
+        os.environ["DEFAULT_FREQUENCY_PENALTY"] = str(config.default_frequency_penalty)
     if config.default_xtc_probability is not None:
         os.environ["DEFAULT_XTC_PROBABILITY"] = str(config.default_xtc_probability)
     if config.default_xtc_threshold is not None:

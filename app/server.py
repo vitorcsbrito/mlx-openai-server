@@ -61,6 +61,7 @@ _SAMPLING_DEFAULT_FIELDS: tuple[str, ...] = (
     "default_min_p",
     "default_repetition_penalty",
     "default_presence_penalty",
+    "default_frequency_penalty",
     "default_xtc_probability",
     "default_xtc_threshold",
     "default_seed",

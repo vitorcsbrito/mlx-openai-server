@@ -391,6 +391,12 @@ def cli():
     help="Default presence penalty for token generation.",
 )
 @click.option(
+    "--frequency-penalty",
+    default=None,
+    type=float,
+    help="Default frequency penalty for token generation.",
+)
+@click.option(
     "--xtc-probability",
     default=None,
     type=float,
@@ -465,6 +471,7 @@ def launch(
     min_p,
     repetition_penalty,
     presence_penalty,
+    frequency_penalty,
     xtc_probability,
     xtc_threshold,
     seed,
@@ -544,6 +551,7 @@ def launch(
         default_min_p=min_p,
         default_repetition_penalty=repetition_penalty,
         default_presence_penalty=presence_penalty,
+        default_frequency_penalty=frequency_penalty,
         default_xtc_probability=xtc_probability,
         default_xtc_threshold=xtc_threshold,
         default_seed=seed,
