@@ -469,6 +469,51 @@ class EmbeddingResponse(OpenAIBaseModel):
     usage: UsageInfo | None = Field(default=None, description="The usage of the embedding.")
 
 
+class RerankRequest(OpenAIBaseModel):
+    """Model for rerank requests (Cohere/Jina-compatible shape)."""
+
+    model: str = Field(..., description="The reranker model to use.")
+    query: str = Field(..., description="The query to score documents against.")
+    documents: list[str] = Field(..., description="Candidate documents to score.")
+    top_n: int | None = Field(
+        default=None, description="Return only the top N results. Defaults to all documents."
+    )
+    return_documents: bool = Field(
+        default=False, description="Echo the document text back in each result."
+    )
+    instruction: str | None = Field(
+        default=None, description="Task instruction. Falls back to the model's default."
+    )
+    user: str | None = Field(default=None, description="User identifier.")
+
+
+class RerankResultDocument(OpenAIBaseModel):
+    """The echoed document text for a rerank result."""
+
+    text: str = Field(..., description="The document text.")
+
+
+class RerankResult(OpenAIBaseModel):
+    """A single scored document in a rerank response."""
+
+    index: int = Field(..., description="Index of the document in the request.")
+    relevance_score: float = Field(..., description="Relevance score in [0, 1].")
+    document: RerankResultDocument | None = Field(
+        default=None, description="The document, when return_documents is set."
+    )
+
+
+class RerankResponse(OpenAIBaseModel):
+    """Represents a rerank response."""
+
+    object: str = Field("list", description="The object type, always 'list'.")
+    model: str = Field(..., description="The model used for reranking.")
+    results: list[RerankResult] = Field(
+        ..., description="Scored documents, sorted by descending relevance."
+    )
+    usage: UsageInfo | None = Field(default=None, description="The usage of the rerank request.")
+
+
 class Model(OpenAIBaseModel):
     """Represents a model in the models list response."""
 

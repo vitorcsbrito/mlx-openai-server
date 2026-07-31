@@ -231,6 +231,7 @@ Supported endpoints:
 | `POST /v1/images/generations` | `image-generation` |
 | `POST /v1/images/edits` | `image-edit` |
 | `POST /v1/embeddings` | `embeddings` |
+| `POST /v1/rerank` | `rerank` |
 | `POST /v1/audio/transcriptions` | `whisper` |
 
 The request `model` should be the model path, `--served-model-name`, or YAML `served_model_name`.
@@ -240,7 +241,7 @@ The request `model` should be the model path, `--served-model-name`, or YAML `se
 | Option | Default | Notes |
 |--------|---------|-------|
 | `--model-path` | required | Local path or Hugging Face repo |
-| `--model-type` | `lm` | `lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `whisper` |
+| `--model-type` | `lm` | `lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `rerank`, `whisper` |
 | `--served-model-name` | model path | Alias accepted in API requests |
 | `--host` | `0.0.0.0` | Bind host |
 | `--port` | `8000` | Bind port |

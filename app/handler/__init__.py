@@ -1,5 +1,5 @@
 """
-MLX model handlers for text, multimodal, image generation, and embeddings models.
+MLX model handlers for text, multimodal, image generation, embeddings, and rerank models.
 """
 
 from typing import Any
@@ -9,6 +9,7 @@ __all__ = [
     "MLXVLMHandler",
     "MLXFluxHandler",
     "MLXEmbeddingsHandler",
+    "MLXRerankHandler",
     "MFLUX_AVAILABLE",
 ]
 
@@ -27,6 +28,10 @@ def __getattr__(name: str) -> Any:
         from .mlx_embeddings import MLXEmbeddingsHandler
 
         return MLXEmbeddingsHandler
+    if name == "MLXRerankHandler":
+        from .mlx_rerank import MLXRerankHandler
+
+        return MLXRerankHandler
     if name == "MLXFluxHandler":
         try:
             from .mflux import MLXFluxHandler

@@ -49,7 +49,7 @@ mlx-openai-server launch --model-path mlx-community/SomeModel-4bit --model-type 
 | Flag | Default | Type | Notes |
 |------|---------|------|-------|
 | `--model-path` | — (required) | str | Required unless `--config` is used. HF repo or local path. |
-| `--model-type` | `lm` | choice | `lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `whisper` |
+| `--model-type` | `lm` | choice | `lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `rerank`, `whisper` |
 | `--served-model-name` | `model_path` | str | Name exposed via `/v1/models` and accepted in the request `model` field. |
 | `--port` | `8000` | int | |
 | `--host` | `0.0.0.0` | str | |
@@ -187,11 +187,12 @@ field.
 | YAML key | Default | Notes |
 |----------|---------|-------|
 | `model_path` | — (required) | HF repo or local path. |
-| `model_type` | `lm` | One of the six valid types. |
+| `model_type` | `lm` | One of the seven valid types. |
 | `served_model_name` | `model_path` | Must be unique across entries. |
 | `context_length` | model default | |
 | `queue_timeout` | `300` | Request timeout (seconds). |
 | `queue_size` | `100` | |
+| `rerank_batch_size` | `8` | `rerank` only. (query, document) pairs scored per forward pass. |
 | `quantize` | none | Image models. |
 | `config_name` | type-dependent | Image models. |
 | `lora_paths` | none | **YAML list** of strings (not comma string). |
@@ -247,6 +248,15 @@ models:
     tool_call_parser: minimax_m2
     reasoning_parser: minimax_m2
 
+  - model_path: mlx-community/Qwen3-Embedding-8B-mxfp8
+    model_type: embeddings
+    served_model_name: embed
+
+  - model_path: mlx-community/Qwen3-VL-Reranker-2B-8bit
+    model_type: rerank
+    served_model_name: rerank
+    rerank_batch_size: 8
+
   - model_path: black-forest-labs/FLUX.2-klein-4B
     model_type: image-generation
     config_name: flux2-klein-4b
@@ -290,4 +300,4 @@ models:
 
 ### Valid `model_type` values
 
-`lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `whisper`.
+`lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `rerank`, `whisper`.

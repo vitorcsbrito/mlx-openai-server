@@ -469,7 +469,7 @@ class HandlerProcessProxy:
         Unique model identifier in the registry.
     handler_type : str
         Handler type string (``"lm"``, ``"multimodal"``, ``"embeddings"``,
-        ``"image"``, ``"whisper"``).
+        ``"rerank"``, ``"image"``, ``"whisper"``).
     model_created : int
         Unix timestamp when the handler process was started.
     """
@@ -479,6 +479,7 @@ class HandlerProcessProxy:
         "lm": "lm",
         "multimodal": "multimodal",
         "embeddings": "embeddings",
+        "rerank": "rerank",
         "image-generation": "image",
         "image-edit": "image",
         "whisper": "whisper",
@@ -1172,6 +1173,23 @@ class HandlerProcessProxy:
             Embeddings result (list of lists of floats).
         """
         return await self._call("generate_embeddings_response", request)
+
+    # -- Rerank handler methods --
+
+    async def generate_rerank_response(self, request: Any) -> Any:
+        """Forward a rerank request to the subprocess.
+
+        Parameters
+        ----------
+        request : RerankRequest
+            The rerank request.
+
+        Returns
+        -------
+        Any
+            One relevance score per document, in input order.
+        """
+        return await self._call("generate_rerank_response", request)
 
     # -- Image generation handler methods --
 

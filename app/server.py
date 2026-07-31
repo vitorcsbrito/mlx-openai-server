@@ -174,7 +174,7 @@ def create_lifespan(config_args: MLXServerConfig):
 
     - Determine the model identifier from the provided ``config_args``
     - Instantiate the appropriate MLX handler based on ``model_type``
-      (multimodal, image-generation, image-edit, embeddings, whisper, or
+      (multimodal, image-generation, image-edit, embeddings, rerank, whisper, or
       text LM)
     - Initialize the handler (including queuing and concurrency setup)
     - Perform an initial memory cleanup
@@ -345,6 +345,17 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
         return _attach_sampling_defaults(
             MLXEmbeddingsHandler(
                 model_path=model_path,
+            ),
+            model_cfg,
+        )
+
+    if model_cfg.model_type == "rerank":
+        from .handler.mlx_rerank import MLXRerankHandler
+
+        return _attach_sampling_defaults(
+            MLXRerankHandler(
+                model_path=model_path,
+                batch_size=model_cfg.rerank_batch_size,
             ),
             model_cfg,
         )
@@ -584,7 +595,7 @@ def setup_server(config_args: MLXServerConfig | MultiModelServerConfig) -> uvico
     # Create FastAPI app with the configured lifespan
     app = FastAPI(
         title="OpenAI-compatible API",
-        description="API for OpenAI-compatible chat completion and text embedding",
+        description="API for OpenAI-compatible chat completion, text embedding, and reranking",
         version=__version__,
         lifespan=lifespan_fn,
     )

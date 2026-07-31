@@ -35,7 +35,7 @@ def derive_capabilities(
     Parameters
     ----------
     model_type : str
-        Model type (``lm``, ``multimodal``, ``embeddings``, ``whisper``,
+        Model type (``lm``, ``multimodal``, ``embeddings``, ``rerank``, ``whisper``,
         ``image-generation``, ``image-edit``).
     enable_auto_tool_choice : bool, optional
         Whether automatic tool-choice is enabled for the model.
@@ -56,6 +56,7 @@ def derive_capabilities(
         "vision": model_type == "multimodal",
         "audio_transcription": model_type == "whisper",
         "embeddings": model_type == "embeddings",
+        "rerank": model_type == "rerank",
         "image_generation": model_type in ("image-generation", "image-edit"),
         "tools": is_text and bool(enable_auto_tool_choice or tool_call_parser),
         "reasoning": is_text and bool(reasoning_parser),

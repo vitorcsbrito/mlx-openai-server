@@ -39,6 +39,7 @@ class MLXServerConfig:
     host: str = "0.0.0.0"
     queue_timeout: int = 300
     queue_size: int = 100
+    rerank_batch_size: int = 8
     disable_auto_resize: bool = False
     quantize: int | None = None
     config_name: str | None = None
@@ -183,6 +184,7 @@ class MLXServerConfig:
             context_length=self.context_length,
             queue_timeout=self.queue_timeout,
             queue_size=self.queue_size,
+            rerank_batch_size=self.rerank_batch_size,
             quantize=self.quantize,
             config_name=self.config_name,
             lora_paths=self.lora_paths,
@@ -249,7 +251,7 @@ class MLXServerConfig:
 # ---------------------------------------------------------------------------
 
 VALID_MODEL_TYPES = frozenset(
-    {"lm", "multimodal", "image-generation", "image-edit", "embeddings", "whisper"}
+    {"lm", "multimodal", "image-generation", "image-edit", "embeddings", "rerank", "whisper"}
 )
 
 
@@ -279,6 +281,9 @@ class ModelEntryConfig:
     # LoRA options
     lora_paths: list[str] | None = None
     lora_scales: list[float] | None = None
+
+    # Rerank options
+    rerank_batch_size: int = 8  # (query, document) pairs scored per forward pass
 
     # On-demand (dynamic swapping) options
     on_demand: bool = False

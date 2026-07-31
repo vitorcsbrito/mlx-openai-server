@@ -23,6 +23,7 @@ from app.core.model_registry import ModelRegistry, derive_capabilities
         ("lm", {"enable_auto_tool_choice": True}, {"text_generation", "streaming", "tools"}),
         ("multimodal", {}, {"text_generation", "streaming", "vision"}),
         ("embeddings", {}, {"embeddings"}),
+        ("rerank", {}, {"rerank"}),
         ("whisper", {}, {"audio_transcription"}),
         ("image-generation", {}, {"image_generation"}),
         ("image-edit", {}, {"image_generation"}),

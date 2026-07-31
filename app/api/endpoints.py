@@ -51,6 +51,10 @@ from ..schemas.openai import (
     Model,
     ModelsResponse,
     OutputTokensDetails,
+    RerankRequest,
+    RerankResponse,
+    RerankResult,
+    RerankResultDocument,
     ResponsesRequest,
     ResponsesResponse,
     ResponseUsage,
@@ -85,7 +89,7 @@ def _get_handler_type(handler: Any) -> str:
     -------
     str
         Handler type string (``"lm"``, ``"multimodal"``, ``"embeddings"``,
-        ``"image"``, ``"whisper"``), or ``""`` if not determinable.
+        ``"rerank"``, ``"image"``, ``"whisper"``), or ``""`` if not determinable.
     """
     return getattr(handler, "handler_type", "")
 
@@ -754,6 +758,53 @@ async def embeddings(
         await _release_on_demand(raw_request)
 
 
+@router.post("/v1/rerank", response_model=None)
+async def rerank(request: RerankRequest, raw_request: Request) -> RerankResponse | JSONResponse:
+    """Handle rerank requests."""
+    handler = await _resolve_handler(raw_request, model_id=request.model)
+    if handler is None:
+        return JSONResponse(
+            content=create_error_response(
+                "Model handler not initialized",
+                "service_unavailable",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ),
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    try:
+        _normalize_request_model(raw_request, request, handler)
+        if _get_handler_type(handler) != "rerank":
+            return JSONResponse(
+                content=create_error_response(
+                    "Unsupported model type for rerank. "
+                    f"Handler for '{request.model}' is {type(handler).__name__}.",
+                    "unsupported_request",
+                    HTTPStatus.BAD_REQUEST,
+                ),
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
+        try:
+            scores = await handler.generate_rerank_response(request)
+            return create_response_rerank(
+                scores,
+                request.documents,
+                request.model,
+                top_n=request.top_n,
+                return_documents=request.return_documents,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception(f"Error processing rerank request: {type(e).__name__}: {e}")
+            return JSONResponse(
+                content=create_error_response(str(e)), status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+    finally:
+        await _release_on_demand(raw_request)
+
+
 @router.post("/v1/images/generations", response_model=None)
 async def image_generations(
     request: ImageGenerationRequest, raw_request: Request
@@ -924,6 +975,48 @@ def create_response_embeddings(
         else:
             embeddings_response.append(EmbeddingResponseData(embedding=embedding, index=index))
     return EmbeddingResponse(object="list", data=embeddings_response, model=model, usage=None)
+
+
+def create_response_rerank(
+    scores: list[float],
+    documents: list[str],
+    model: str,
+    *,
+    top_n: int | None = None,
+    return_documents: bool = False,
+) -> RerankResponse:
+    """Create a rerank response from per-document scores.
+
+    Parameters
+    ----------
+    scores : list[float]
+        Relevance scores, aligned with ``documents``.
+    documents : list[str]
+        The candidate documents that were scored.
+    model : str
+        Model name used for reranking.
+    top_n : int | None, optional
+        Truncate to the ``top_n`` highest-scoring results, by default all.
+    return_documents : bool, optional
+        Echo the document text in each result, by default False.
+
+    Returns
+    -------
+    RerankResponse
+        Results sorted by descending relevance score.
+    """
+    results = [
+        RerankResult(
+            index=index,
+            relevance_score=score,
+            document=RerankResultDocument(text=documents[index]) if return_documents else None,
+        )
+        for index, score in enumerate(scores)
+    ]
+    results.sort(key=lambda r: r.relevance_score, reverse=True)
+    if top_n is not None and top_n >= 0:
+        results = results[:top_n]
+    return RerankResponse(object="list", model=model, results=results, usage=None)
 
 
 def create_response_chunk(
