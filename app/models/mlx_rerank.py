@@ -3,6 +3,8 @@ import gc
 import mlx.core as mx
 from mlx_embeddings.utils import load
 
+from ._qwen3_vl_state import reset_rope_cache
+
 
 class MLX_Rerank:
     """Cross-encoder reranker: scores (query, document) pairs in one forward pass.
@@ -35,6 +37,8 @@ class MLX_Rerank:
 
         scores = None
         try:
+            # Per batch, not per request: each batch pads to its own longest pair.
+            reset_rope_cache(self.model)
             scores = self.model.rerank(payload, self.processor)
             mx.eval(scores)
             return [float(s) for s in scores.reshape(-1).tolist()]
