@@ -378,6 +378,56 @@ async def test_stop_closes_batch_generator(patched_scheduler):
     assert fake.closed is True
 
 
+def _make_active_request(patched_scheduler, **overrides: Any):
+    """Construct a minimal ``_ActiveRequest`` for timing-helper tests."""
+    fields = {
+        "loop": None,
+        "out_queue": None,
+        "detokenizer": None,
+        "cancel_event": threading.Event(),
+        "prompt_tokens": 0,
+        "cached_prompt_tokens": 0,
+        "pending_segment_types": [],
+    }
+    fields.update(overrides)
+    return patched_scheduler._ActiveRequest(**fields)
+
+
+def test_compute_prompt_tps_over_processed_tokens(patched_scheduler):
+    """prompt_tps divides prefilled (non-cached) tokens by the prefill interval."""
+    state = _make_active_request(
+        patched_scheduler,
+        prompt_tokens=100,
+        cached_prompt_tokens=20,
+        prefill_start_time=10.0,
+        first_token_time=10.4,  # 0.4s prefill -> 80 tokens / 0.4s = 200 tps
+    )
+    assert patched_scheduler.BatchScheduler._compute_prompt_tps(state) == pytest.approx(200.0)
+
+
+def test_compute_prompt_tps_full_cache_hit_is_zero(patched_scheduler):
+    """A full cache hit (nothing prefilled) reports 0.0, not a divide error."""
+    state = _make_active_request(
+        patched_scheduler,
+        prompt_tokens=50,
+        cached_prompt_tokens=50,
+        prefill_start_time=10.0,
+        first_token_time=10.2,
+    )
+    assert patched_scheduler.BatchScheduler._compute_prompt_tps(state) == 0.0
+
+
+def test_compute_prompt_tps_missing_timing_is_zero(patched_scheduler):
+    """No first-token timestamp yet -> 0.0."""
+    state = _make_active_request(
+        patched_scheduler,
+        prompt_tokens=10,
+        prefill_start_time=10.0,
+        first_token_time=None,
+    )
+    assert patched_scheduler.BatchScheduler._compute_prompt_tps(state) == 0.0
+
+
 def test_default_state_machine_builds_with_eos(patched_scheduler):
     """EOS tokens from the tokenizer should be wired into the default state machine."""
     tok = FakeTokenizer(eos_token_ids=[2, 3])
@@ -505,7 +555,7 @@ async def test_admission_reclaims_lru_based_on_live_batch(patched_scheduler):
         max_bytes = 1_000
         trim_calls: list[int] = []
 
-        def fetch_nearest_cache(self, _tokens):
+        def fetch_nearest_cache(self, _tokens, **_kwargs):
             return None, list(_tokens)
 
         def trim_to(self, *, n_bytes):
@@ -589,7 +639,7 @@ async def test_exact_cache_hit_is_backed_off_before_kickoff_token(patched_schedu
             self.nbytes = nbytes
 
     class _FakeLRU:
-        def fetch_nearest_cache(self, tokens):
+        def fetch_nearest_cache(self, tokens, **_kwargs):
             if tokens == [1, 2, 3]:
                 return [_FakeLayer()], []
             raise AssertionError(f"unexpected fetch for tokens={tokens}")
@@ -644,7 +694,7 @@ async def test_exact_non_trimmable_cache_hit_falls_back_to_reprefill(patched_sch
         nbytes = 0
 
     class _FakeLRU:
-        def fetch_nearest_cache(self, tokens):
+        def fetch_nearest_cache(self, tokens, **_kwargs):
             if tokens == [1, 2, 3]:
                 return [_FakeLayer()], []
             if tokens == [1, 2]:
@@ -702,7 +752,7 @@ async def test_exact_non_trimmable_cache_hit_logs_info(patched_scheduler):
         nbytes = 0
 
     class _FakeLRU:
-        def fetch_nearest_cache(self, tokens):
+        def fetch_nearest_cache(self, tokens, **_kwargs):
             if tokens == [1, 2, 3]:
                 return [_FakeLayer()], []
             if tokens == [1, 2]:
@@ -773,3 +823,52 @@ async def test_submit_stream_raises_queue_full_when_admission_queue_is_saturated
 
     with pytest.raises(asyncio.QueueFull):
         scheduler.submit_stream(input_ids=[2], max_tokens=4)
+
+
+def test_failed_checkpoint_insert_reclaims_mlx_memory(patched_scheduler):
+    """A failed checkpoint insert must reclaim MLX buffers and not propagate.
+
+    Regression for the OOM cascade: when ``insert_cache`` raises (commonly a
+    Metal OOM while the KV cache is materialized for serialization), the
+    scheduler must drop the extracted cache references and trim MLX buffers so
+    the next request does not inherit an exhausted allocator and OOM as well.
+    """
+    bsm = patched_scheduler
+
+    clear_calls: list[int] = []
+    bsm.pytest_monkeypatch.setattr(bsm.mx, "clear_cache", lambda: clear_calls.append(1))
+
+    class _RaisingPromptCache:
+        def insert_cache(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("[METAL] Insufficient memory")
+
+    extracted_cache = object()
+
+    class _FakeBatchGeneratorWithCache:
+        def extract_cache(self, uids: list[int]) -> dict[int, tuple[Any, list[int]]]:
+            return {uid: (extracted_cache, [1, 2, 3]) for uid in uids}
+
+    scheduler = bsm.BatchScheduler(
+        model=object(),
+        tokenizer=FakeTokenizer(),
+    )
+    scheduler._prompt_cache = _RaisingPromptCache()
+    scheduler._batch_generator = _FakeBatchGeneratorWithCache()
+    scheduler._active = {
+        7: bsm._ActiveRequest(
+            loop=None,
+            out_queue=None,
+            detokenizer=None,
+            cancel_event=threading.Event(),
+            prompt_tokens=3,
+            cached_prompt_tokens=0,
+            pending_segment_types=["tool"],
+        )
+    }
+
+    response = types.SimpleNamespace(uid=7, end_of_segment=True, end_of_prompt=False)
+
+    # Must not raise despite the failing insert.
+    scheduler._handle_prompt_responses([response])
+
+    assert clear_calls, "expected mx.clear_cache() after a failed checkpoint insert"

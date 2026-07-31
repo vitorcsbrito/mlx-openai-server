@@ -61,10 +61,13 @@ _SAMPLING_DEFAULT_FIELDS: tuple[str, ...] = (
     "default_min_p",
     "default_repetition_penalty",
     "default_presence_penalty",
+    "default_frequency_penalty",
     "default_xtc_probability",
     "default_xtc_threshold",
     "default_seed",
     "default_repetition_context_size",
+    "default_presence_context_size",
+    "default_frequency_context_size",
 )
 
 
@@ -86,15 +89,41 @@ def _attach_sampling_defaults(handler: Any, config: Any) -> Any:
     return handler
 
 
+# Shared log format for both the console and file sinks. Color/markup tags
+# are rendered on the (colorized) console sink and automatically stripped by
+# loguru on the (non-colorized) file sink, so both carry the same fields —
+# crucially including ``name:function:line`` so the file is a faithful
+# transcript of the console rather than a stripped-down subset.
+_LOG_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+    "<level>{level: <8}</level> | "
+    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+    "✦ <level>{message}</level>"
+)
+
+
 def configure_logging(
-    log_file: str | None = None, no_log_file: bool = False, log_level: str = "INFO"
+    log_file: str | None = None,
+    no_log_file: bool = False,
+    log_level: str = "INFO",
+    *,
+    enable_rotation: bool = True,
 ) -> None:
     """Set up loguru handlers used by the server.
 
     This helper replaces the default loguru handler with a console
     handler using a compact, colored format. When ``no_log_file`` is
-    False a rotating file handler is also added using ``log_file`` or
-    a default path.
+    False a file handler is also added using ``log_file`` or a default
+    path, sharing the same format as the console (minus color) so the
+    file is a faithful transcript rather than a stripped-down subset.
+
+    Because each model handler runs in its own spawned subprocess and
+    loguru configuration does not survive ``spawn``, this function is
+    called both in the parent process and in every child process (see
+    ``app.core.handler_process._handler_worker``). All processes append
+    to the same ``log_file``, but only the parent owns rotation/retention
+    (``enable_rotation``) to avoid multiple processes racing to rotate
+    the same file.
 
     Parameters
     ----------
@@ -107,28 +136,37 @@ def configure_logging(
         emitted.
     log_level:
         Minimum log level to emit (e.g. "DEBUG", "INFO").
+    enable_rotation:
+        When True (the parent process) the file sink rotates at 500 MB
+        and retains 10 days of history. Child processes pass False so
+        they only ever append, leaving rotation to the parent.
     """
     logger.remove()  # Remove default handler
 
-    # Add console handler
+    # Add console handler. Use ``sys.stderr`` rather than ``print`` as the
+    # sink: loguru's formatted message already ends with a newline, so passing
+    # ``print`` (which appends its own newline) produced a blank line between
+    # every console record. A file-like sink is written via ``.write()`` and
+    # adds no extra newline, matching the file sink output.
     logger.add(
-        print,
+        sys.stderr,
         level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-        "✦ <level>{message}</level>",
+        format=_LOG_FORMAT,
         colorize=True,
     )
     if not no_log_file:
         file_path = log_file or "logs/app.log"
-        logger.add(
-            file_path,
-            rotation="500 MB",
-            retention="10 days",
-            level=log_level,
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
-        )
+        file_kwargs: dict[str, object] = {
+            "level": log_level,
+            "format": _LOG_FORMAT,
+            # Serialize writes within a process; combined with append-mode
+            # this keeps records intact when parent + children share a file.
+            "enqueue": True,
+        }
+        if enable_rotation:
+            file_kwargs["rotation"] = "500 MB"
+            file_kwargs["retention"] = "10 days"
+        logger.add(file_path, **file_kwargs)
 
 
 def create_lifespan(config_args: MLXServerConfig):
@@ -139,7 +177,7 @@ def create_lifespan(config_args: MLXServerConfig):
 
     - Determine the model identifier from the provided ``config_args``
     - Instantiate the appropriate MLX handler based on ``model_type``
-      (multimodal, image-generation, image-edit, embeddings, whisper, or
+      (multimodal, image-generation, image-edit, embeddings, rerank, whisper, or
       text LM)
     - Initialize the handler (including queuing and concurrency setup)
     - Perform an initial memory cleanup
@@ -314,6 +352,17 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
             model_cfg,
         )
 
+    if model_cfg.model_type == "rerank":
+        from .handler.mlx_rerank import MLXRerankHandler
+
+        return _attach_sampling_defaults(
+            MLXRerankHandler(
+                model_path=model_path,
+                batch_size=model_cfg.rerank_batch_size,
+            ),
+            model_cfg,
+        )
+
     if model_cfg.model_type == "whisper":
         from .handler.mlx_whisper import MLXWhisperHandler
 
@@ -341,6 +390,7 @@ def create_handler_from_config(model_cfg: ModelEntryConfig) -> Any:
             prompt_cache_size=model_cfg.prompt_cache_size,
             prompt_cache_max_bytes=model_cfg.prompt_cache_max_bytes,
             prompt_cache_dir=model_cfg.prompt_cache_dir,
+            prompt_cache_auto_segment=model_cfg.prompt_cache_auto_segment,
             draft_model_path=model_cfg.draft_model_path,
             num_draft_tokens=model_cfg.num_draft_tokens,
             kv_bits=model_cfg.kv_bits,
@@ -409,6 +459,11 @@ def create_multi_lifespan(config: MultiModelServerConfig):
                 queue_config = {
                     "timeout": model_cfg.queue_timeout,
                     "queue_size": model_cfg.queue_size,
+                    # Logging config so the spawned child can reconstruct the
+                    # same sinks (loguru state does not survive ``spawn``).
+                    "log_file": config.log_file,
+                    "no_log_file": config.no_log_file,
+                    "log_level": config.log_level,
                 }
 
                 if model_cfg.on_demand:
@@ -449,6 +504,9 @@ def create_multi_lifespan(config: MultiModelServerConfig):
                     handler=proxy,
                     model_type=model_cfg.model_type,
                     context_length=model_cfg.context_length,
+                    enable_auto_tool_choice=model_cfg.enable_auto_tool_choice,
+                    tool_call_parser=model_cfg.tool_call_parser,
+                    reasoning_parser=model_cfg.reasoning_parser,
                 )
                 logger.info(f"Model '{model_id}' spawned and registered successfully")
 
@@ -540,7 +598,7 @@ def setup_server(config_args: MLXServerConfig | MultiModelServerConfig) -> uvico
     # Create FastAPI app with the configured lifespan
     app = FastAPI(
         title="OpenAI-compatible API",
-        description="API for OpenAI-compatible chat completion and text embedding",
+        description="API for OpenAI-compatible chat completion, text embedding, and reranking",
         version=__version__,
         lifespan=lifespan_fn,
     )
@@ -594,6 +652,10 @@ def setup_server(config_args: MLXServerConfig | MultiModelServerConfig) -> uvico
         implementation details to clients.
         """
         logger.error(f"Global exception handler caught: {exc!s}", exc_info=True)
+        # A failed/timed-out request may have left GPU allocations behind;
+        # reclaim them so one error does not cascade into OOM on later requests.
+        _clear_mlx_cache()
+        gc.collect()
         return JSONResponse(
             status_code=500,
             content={"error": {"message": "Internal server error", "type": "internal_error"}},

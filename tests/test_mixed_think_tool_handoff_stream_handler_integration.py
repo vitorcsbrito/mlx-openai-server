@@ -9,6 +9,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import threading
 import types
 import unittest
 
@@ -62,7 +63,9 @@ class _FakeStreamChunk:
     prompt_tokens: int = 11
     generation_tokens: int = 7
     generation_tps: float = 1.0
+    prompt_tps: float = 1.0
     peak_memory: float = 0.0
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -80,6 +83,12 @@ class _FakeNonStreamResponse:
 class _FakeModel:
     """Tiny model stub used by ``generate_text_stream``."""
 
+    # Routes _is_request_batchable to the single-request path these tests exercise.
+    has_draft_model = False
+    cache_is_batchable = False
+    # Trimmable cache skips the checkpoint-boundary branch in _build_inference_context.
+    cache_is_trimmable = True
+
     def create_input_prompt(self, messages: list[dict[str, str]], kwargs: dict[str, object]) -> str:
         return "prompt"
 
@@ -96,7 +105,9 @@ class _FakePromptCache:
     def __init__(self) -> None:
         self.inserted_keys: list[list[int]] = []
 
-    def fetch_nearest_cache(self, input_ids: list[int]) -> tuple[None, list[int]]:
+    def fetch_nearest_cache(
+        self, input_ids: list[int], **_kwargs: object
+    ) -> tuple[None, list[int]]:
         return None, input_ids
 
     def insert_cache(self, cache_key: list[int], cache: object) -> None:
@@ -116,8 +127,23 @@ class _FakeInferenceWorker:
 
     def submit_stream(self, *args: object, **kwargs: object) -> AsyncIterator[_FakeStreamChunk]:
         async def _gen() -> AsyncIterator[_FakeStreamChunk]:
-            for chunk in self._chunks:
-                yield chunk
+            if self._chunks:
+                for chunk in self._chunks:
+                    yield chunk
+            elif self._non_stream_response is not None:
+                # The non-batched non-streaming path drains submit_stream and
+                # accumulates the result, so deliver the configured response as
+                # a single terminal chunk.
+                response = self._non_stream_response
+                yield _FakeStreamChunk(
+                    text=response.text,
+                    token=response.tokens[-1] if response.tokens else 0,
+                    prompt_tokens=response.prompt_tokens,
+                    generation_tokens=response.generation_tokens,
+                    generation_tps=response.generation_tps,
+                    peak_memory=response.peak_memory,
+                    finish_reason="stop",
+                )
 
         return _gen()
 
@@ -144,6 +170,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             [
                 _FakeStreamChunk("<thinking>before ", token=101),
@@ -202,6 +229,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             [
                 _FakeStreamChunk("<thinking>tail-check:", token=201),
@@ -268,6 +296,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             non_stream_response=_FakeNonStreamResponse(
                 text=(
@@ -329,6 +358,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "hermes"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             non_stream_response=_FakeNonStreamResponse(
                 text=(
@@ -365,6 +395,102 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         assert "<think>" not in visible_content
         assert "<tool_call>" not in visible_content
 
+    def test_nonstream_recovers_tool_call_emitted_inside_reasoning_block(self) -> None:
+        """Self-healing recovers a well-formed tool call stranded inside ``<think>``.
+
+        Non fine-tuned models sometimes "think out loud" and emit a complete
+        ``<tool_call>`` block inside the reasoning span. ``extract_reasoning``
+        swallows that span into ``reasoning_content``, so the tool parser (which
+        only sees the post-``</think>`` tail) would otherwise miss it.
+        """
+        handler_cls = _load_mlx_lm_handler_class()
+        handler = object.__new__(handler_cls)
+
+        handler.debug = False
+        handler.message_converter = None
+        handler.enable_auto_tool_choice = False
+        handler.reasoning_parser_name = "qwen3_moe"
+        handler.tool_parser_name = "hermes"
+        handler.model = _FakeModel()
+        handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
+        handler.inference_worker = _FakeInferenceWorker(
+            non_stream_response=_FakeNonStreamResponse(
+                text=(
+                    "<think>\n"
+                    "I should read the file to answer this.\n"
+                    '<tool_call>{"name":"read_file","arguments":{"path":"app/handler/mlx_lm.py"}}</tool_call>\n'
+                    "</think>\n"
+                ),
+                tokens=[1, 2, 3],
+                prompt_tokens=100,
+                generation_tokens=20,
+            )
+        )
+
+        async def _fake_prepare_text_request(
+            self: object, request: object
+        ) -> tuple[list[dict[str, str]], dict[str, object]]:
+            return [{"role": "user", "content": "hello"}], {"chat_template_kwargs": {}}
+
+        handler._prepare_text_request = types.MethodType(_fake_prepare_text_request, handler)
+
+        result = asyncio.run(handler.generate_text_response(request=object()))
+        parsed = result["response"]
+
+        assert isinstance(parsed, dict)
+        assert isinstance(parsed.get("tool_calls"), list)
+        assert len(parsed["tool_calls"]) == 1
+        assert parsed["tool_calls"][0]["name"] == "read_file"
+        assert json.loads(parsed["tool_calls"][0]["arguments"]) == {"path": "app/handler/mlx_lm.py"}
+        # The recovered tool-call block must be stripped from the reasoning text.
+        reasoning = parsed.get("reasoning_content")
+        if isinstance(reasoning, str):
+            assert "<tool_call>" not in reasoning
+            assert "I should read the file" in reasoning
+
+    def test_nonstream_does_not_recover_when_post_reasoning_tool_call_exists(self) -> None:
+        """Self-healing must not fire when the normal post-``</think>`` path succeeds."""
+        handler_cls = _load_mlx_lm_handler_class()
+        handler = object.__new__(handler_cls)
+
+        handler.debug = False
+        handler.message_converter = None
+        handler.enable_auto_tool_choice = False
+        handler.reasoning_parser_name = "qwen3_moe"
+        handler.tool_parser_name = "hermes"
+        handler.model = _FakeModel()
+        handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
+        handler.inference_worker = _FakeInferenceWorker(
+            non_stream_response=_FakeNonStreamResponse(
+                text=(
+                    "<think>\nplanning the call\n</think>\n"
+                    '<tool_call>{"name":"list_dir","arguments":{"path":"app"}}</tool_call>\n'
+                ),
+                tokens=[1, 2, 3],
+                prompt_tokens=100,
+                generation_tokens=20,
+            )
+        )
+
+        async def _fake_prepare_text_request(
+            self: object, request: object
+        ) -> tuple[list[dict[str, str]], dict[str, object]]:
+            return [{"role": "user", "content": "hello"}], {"chat_template_kwargs": {}}
+
+        handler._prepare_text_request = types.MethodType(_fake_prepare_text_request, handler)
+
+        result = asyncio.run(handler.generate_text_response(request=object()))
+        parsed = result["response"]
+
+        assert isinstance(parsed, dict)
+        assert isinstance(parsed.get("tool_calls"), list)
+        assert len(parsed["tool_calls"]) == 1
+        assert parsed["tool_calls"][0]["name"] == "list_dir"
+        # Reasoning content stays intact; the genuine reasoning span had no tool call.
+        assert parsed.get("reasoning_content") == "<think>\nplanning the call\n"
+
     def test_stream_step35_parses_tool_call_when_output_starts_with_stray_think_close(self) -> None:
         """Streaming should parse tool calls even when output starts with stray ``</think>``."""
         handler_cls = _load_mlx_lm_handler_class()
@@ -377,6 +503,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             [
                 _FakeStreamChunk("</think>\nprefix text before tool.\n", token=301),
@@ -434,6 +561,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             [
                 _FakeStreamChunk("I should inspect both handlers first.\n", token=351),
@@ -500,6 +628,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             non_stream_response=_FakeNonStreamResponse(
                 text=(
@@ -560,6 +689,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             [
                 _FakeStreamChunk("I should inspect both handlers first.\n", token=371),
@@ -612,6 +742,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             [
                 _FakeStreamChunk(
@@ -673,6 +804,7 @@ class MixedThinkToolHandoffStreamHandlerIntegrationTests(unittest.TestCase):
         handler.tool_parser_name = "step_35"
         handler.model = _FakeModel()
         handler.prompt_cache = _FakePromptCache()
+        handler._generation_lock = threading.Lock()
         handler.inference_worker = _FakeInferenceWorker(
             [
                 _FakeStreamChunk("prefix text.<too", token=501),

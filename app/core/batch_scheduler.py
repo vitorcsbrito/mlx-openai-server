@@ -142,6 +142,7 @@ class _ActiveRequest:
     # segment boundary fires during prefill so the popped label becomes the
     # ``cache_type`` for the extracted checkpoint.
     pending_segment_types: list[str]
+    prefill_start_time: float | None = None
     first_token_time: float | None = None
     generation_tokens: int = 0
 
@@ -647,6 +648,7 @@ class BatchScheduler:
                 prompt_tokens=len(request.input_ids),
                 cached_prompt_tokens=cached_prefix_len,
                 pending_segment_types=pending_segment_types,
+                prefill_start_time=time.perf_counter(),
             )
             logger.info(
                 f"BatchScheduler admitted uid={uid} "
@@ -791,6 +793,19 @@ class BatchScheduler:
                 logger.warning(
                     f"prompt_cache.insert_cache ({cache_type}) failed for uid={uid}: {exc!s}"
                 )
+                # A failed checkpoint insert is commonly a Metal OOM raised while
+                # the KV cache is materialized for serialization. Swallowing it
+                # without reclaiming leaves the allocator exhausted, so the next
+                # request (and any retry) OOMs immediately. Drop every extracted
+                # cache reference and trim MLX buffers before bailing out so the
+                # process can recover instead of cascading.
+                cache = None
+                caches.clear()
+                try:
+                    mx.clear_cache()
+                except Exception as clear_exc:  # noqa: BLE001 — reclaim is best-effort
+                    logger.warning(f"mx.clear_cache after failed insert failed: {clear_exc!s}")
+                return
 
     def _handle_generation_response(self, resp: Any) -> None:
         """Forward a single generation-batch response to the owning request."""
@@ -839,7 +854,7 @@ class BatchScheduler:
             generation_tps=self._compute_tps(state) if is_final else 0.0,
             prompt_tokens=state.prompt_tokens,
             cached_prompt_tokens=state.cached_prompt_tokens,
-            prompt_tps=0.0,
+            prompt_tps=self._compute_prompt_tps(state) if is_final else 0.0,
             peak_memory=(mx.get_peak_memory() / 1e9) if is_final else 0.0,
         )
         self._send(state.loop, state.out_queue, chunk)
@@ -889,6 +904,25 @@ class BatchScheduler:
         if elapsed <= 0:
             return 0.0
         return state.generation_tokens / elapsed
+
+    @staticmethod
+    def _compute_prompt_tps(state: _ActiveRequest) -> float:
+        """Prompt-processing throughput (prefilled tokens per second).
+
+        Measured over the tokens actually prefilled (full prompt minus the
+        cached prefix) across the interval from batch admission to the first
+        generated token. Returns ``0.0`` when timing is unavailable or no
+        tokens required prefilling (full cache hit).
+        """
+        if state.prefill_start_time is None or state.first_token_time is None:
+            return 0.0
+        processed = state.prompt_tokens - state.cached_prompt_tokens
+        if processed <= 0:
+            return 0.0
+        elapsed = state.first_token_time - state.prefill_start_time
+        if elapsed <= 0:
+            return 0.0
+        return processed / elapsed
 
     def _process_cancellations(self) -> None:
         """Remove any active sequences whose client has cancelled."""

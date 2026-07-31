@@ -156,6 +156,41 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
     cached_tokens: int | None = None
 
 
+class CompletionTimingsInfo(OpenAIBaseModel):
+    """Per-request throughput timings, in tokens per second.
+
+    Non-standard additive field. Values are populated on the final
+    response (non-streaming) or final usage chunk (streaming); they are
+    ``None`` when the handler did not report timing data.
+    """
+
+    prompt_tps: float | None = None
+    generation_tps: float | None = None
+
+    @classmethod
+    def from_stats(cls, source: Any) -> CompletionTimingsInfo:
+        """Build timings from a generation result or batch chunk.
+
+        Parameters
+        ----------
+        source : Any
+            Object exposing ``prompt_tps`` and/or ``generation_tps`` floats
+            (e.g. ``mlx_lm`` ``GenerationResponse`` or ``BatchChunk``).
+            Missing or zero values are reported as ``None``.
+
+        Returns
+        -------
+        CompletionTimingsInfo
+            Timings with throughput rounded to two decimal places.
+        """
+        prompt_tps = getattr(source, "prompt_tps", None)
+        generation_tps = getattr(source, "generation_tps", None)
+        return cls(
+            prompt_tps=round(prompt_tps, 2) if prompt_tps else None,
+            generation_tps=round(generation_tps, 2) if generation_tps else None,
+        )
+
+
 class StreamOptions(OpenAIBaseModel):
     """Stream options for a request."""
 
@@ -170,6 +205,7 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    timings: CompletionTimingsInfo | None = None
 
 
 class FunctionCall(OpenAIBaseModel):
@@ -298,6 +334,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
     repetition_context_size: int | None = Field(
         None, description="Repetition context size for token generation."
+    )
+    presence_context_size: int | None = Field(
+        None, description="Number of previous tokens the presence penalty considers."
+    )
+    frequency_context_size: int | None = Field(
+        None, description="Number of previous tokens the frequency penalty considers."
     )
     xtc_probability: float | None = Field(
         None, description="XTC (eXclude Top Choices) sampling probability (0.0-1.0)."
@@ -431,6 +473,51 @@ class EmbeddingResponse(OpenAIBaseModel):
     data: list[EmbeddingResponseData] = Field(..., description="List of embedding objects.")
     model: str = Field(..., description="The model used for embedding.")
     usage: UsageInfo | None = Field(default=None, description="The usage of the embedding.")
+
+
+class RerankRequest(OpenAIBaseModel):
+    """Model for rerank requests (Cohere/Jina-compatible shape)."""
+
+    model: str = Field(..., description="The reranker model to use.")
+    query: str = Field(..., description="The query to score documents against.")
+    documents: list[str] = Field(..., description="Candidate documents to score.")
+    top_n: int | None = Field(
+        default=None, description="Return only the top N results. Defaults to all documents."
+    )
+    return_documents: bool = Field(
+        default=False, description="Echo the document text back in each result."
+    )
+    instruction: str | None = Field(
+        default=None, description="Task instruction. Falls back to the model's default."
+    )
+    user: str | None = Field(default=None, description="User identifier.")
+
+
+class RerankResultDocument(OpenAIBaseModel):
+    """The echoed document text for a rerank result."""
+
+    text: str = Field(..., description="The document text.")
+
+
+class RerankResult(OpenAIBaseModel):
+    """A single scored document in a rerank response."""
+
+    index: int = Field(..., description="Index of the document in the request.")
+    relevance_score: float = Field(..., description="Relevance score in [0, 1].")
+    document: RerankResultDocument | None = Field(
+        default=None, description="The document, when return_documents is set."
+    )
+
+
+class RerankResponse(OpenAIBaseModel):
+    """Represents a rerank response."""
+
+    object: str = Field("list", description="The object type, always 'list'.")
+    model: str = Field(..., description="The model used for reranking.")
+    results: list[RerankResult] = Field(
+        ..., description="Scored documents, sorted by descending relevance."
+    )
+    usage: UsageInfo | None = Field(default=None, description="The usage of the rerank request.")
 
 
 class Model(OpenAIBaseModel):

@@ -150,15 +150,15 @@ def cli():
     "--model-path",
     required=False,
     default=None,
-    help="Path to the model (required for lm, multimodal, embeddings, image-generation, image-edit, whisper model types). With `image-generation` or `image-edit` model types, it should be the local path to the model.",
+    help="Path to the model (required for lm, multimodal, embeddings, rerank, image-generation, image-edit, whisper model types). With `image-generation` or `image-edit` model types, it should be the local path to the model.",
 )
 @click.option(
     "--model-type",
     default="lm",
     type=click.Choice(
-        ["lm", "multimodal", "image-generation", "image-edit", "embeddings", "whisper"]
+        ["lm", "multimodal", "image-generation", "image-edit", "embeddings", "rerank", "whisper"]
     ),
-    help="Type of model to run (lm: text-only, multimodal: text+vision+audio, image-generation: flux image generation, image-edit: flux image edit, embeddings: text embeddings, whisper: audio transcription)",
+    help="Type of model to run (lm: text-only, multimodal: text+vision+audio, image-generation: flux image generation, image-edit: flux image edit, embeddings: text embeddings, rerank: cross-encoder reranking, whisper: audio transcription)",
 )
 @click.option(
     "--context-length",
@@ -275,8 +275,22 @@ def cli():
     default=None,
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
     help=(
-        "Directory for disk-backed prompt KV cache payloads. "
-        "Defaults to a process-local temporary directory."
+        "Directory for disk-backed prompt KV cache payloads. When set, the "
+        "cache persists across restarts and is rehydrated on startup (only "
+        "entries matching the same model and KV-cache configuration are "
+        "reused). Defaults to a process-local temporary directory that is "
+        "removed on shutdown."
+    ),
+)
+@click.option(
+    "--prompt-cache-auto-segment",
+    is_flag=True,
+    default=False,
+    help=(
+        "Auto-segment the prompt KV cache at role boundaries so multi-turn "
+        "and tool-heavy conversations can reuse cached prefixes mid-history. "
+        "Only works with language models (lm); supports both trimmable and "
+        "non-trimmable (hybrid SSM, e.g. Qwen3.5) KV caches."
     ),
 )
 @click.option(
@@ -377,6 +391,12 @@ def cli():
     help="Default presence penalty for token generation.",
 )
 @click.option(
+    "--frequency-penalty",
+    default=None,
+    type=float,
+    help="Default frequency penalty for token generation.",
+)
+@click.option(
     "--xtc-probability",
     default=None,
     type=float,
@@ -394,6 +414,18 @@ def cli():
     default=None,
     type=int,
     help="Default repetition context size parameter.",
+)
+@click.option(
+    "--presence-context-size",
+    default=None,
+    type=int,
+    help="Default number of previous tokens the presence penalty considers.",
+)
+@click.option(
+    "--frequency-context-size",
+    default=None,
+    type=int,
+    help="Default number of previous tokens the frequency penalty considers.",
 )
 def launch(
     config_file,
@@ -422,6 +454,7 @@ def launch(
     prompt_cache_size,
     prompt_cache_max_bytes,
     prompt_cache_dir,
+    prompt_cache_auto_segment,
     draft_model_path,
     num_draft_tokens,
     kv_bits,
@@ -438,10 +471,13 @@ def launch(
     min_p,
     repetition_penalty,
     presence_penalty,
+    frequency_penalty,
     xtc_probability,
     xtc_threshold,
     seed,
     repetition_context_size,
+    presence_context_size,
+    frequency_context_size,
 ) -> None:
     """Start the FastAPI/Uvicorn server with the supplied flags.
 
@@ -498,6 +534,7 @@ def launch(
         prompt_cache_size=prompt_cache_size,
         prompt_cache_max_bytes=prompt_cache_max_bytes,
         prompt_cache_dir=prompt_cache_dir,
+        prompt_cache_auto_segment=prompt_cache_auto_segment,
         draft_model_path=draft_model_path,
         num_draft_tokens=num_draft_tokens,
         kv_bits=kv_bits,
@@ -514,10 +551,13 @@ def launch(
         default_min_p=min_p,
         default_repetition_penalty=repetition_penalty,
         default_presence_penalty=presence_penalty,
+        default_frequency_penalty=frequency_penalty,
         default_xtc_probability=xtc_probability,
         default_xtc_threshold=xtc_threshold,
         default_seed=seed,
         default_repetition_context_size=repetition_context_size,
+        default_presence_context_size=presence_context_size,
+        default_frequency_context_size=frequency_context_size,
     )
 
     # Single-model launches always run through the HandlerProcessProxy

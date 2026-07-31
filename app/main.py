@@ -242,6 +242,8 @@ def _apply_sampling_env(config: MLXServerConfig) -> None:
         os.environ["DEFAULT_REPETITION_PENALTY"] = str(config.default_repetition_penalty)
     if config.default_presence_penalty is not None:
         os.environ["DEFAULT_PRESENCE_PENALTY"] = str(config.default_presence_penalty)
+    if config.default_frequency_penalty is not None:
+        os.environ["DEFAULT_FREQUENCY_PENALTY"] = str(config.default_frequency_penalty)
     if config.default_xtc_probability is not None:
         os.environ["DEFAULT_XTC_PROBABILITY"] = str(config.default_xtc_probability)
     if config.default_xtc_threshold is not None:
@@ -250,6 +252,10 @@ def _apply_sampling_env(config: MLXServerConfig) -> None:
         os.environ["DEFAULT_SEED"] = str(config.default_seed)
     if config.default_repetition_context_size is not None:
         os.environ["DEFAULT_REPETITION_CONTEXT_SIZE"] = str(config.default_repetition_context_size)
+    if config.default_presence_context_size is not None:
+        os.environ["DEFAULT_PRESENCE_CONTEXT_SIZE"] = str(config.default_presence_context_size)
+    if config.default_frequency_context_size is not None:
+        os.environ["DEFAULT_FREQUENCY_CONTEXT_SIZE"] = str(config.default_frequency_context_size)
 
 
 async def start(config: MLXServerConfig) -> None:
@@ -267,11 +273,12 @@ async def start(config: MLXServerConfig) -> None:
     """
     try:
         _apply_sampling_env(config)
+        # setup_server() configures logging (console + file sinks); build it
+        # before the banner so the startup banner is captured in the log file.
+        uvconfig = setup_server(config)
         # Display startup information
         print_startup_banner(config)
 
-        # Set up and start the server
-        uvconfig = setup_server(config)
         logger.info("Server configuration complete.")
         logger.info("Starting Uvicorn server...")
         server = uvicorn.Server(uvconfig)
@@ -295,9 +302,10 @@ async def start_multi(config: MultiModelServerConfig) -> None:
         Multi-model YAML-based configuration.
     """
     try:
-        print_multi_startup_banner(config)
-
+        # setup_server() configures logging (console + file sinks); build it
+        # before the banner so the banner is captured in the log file too.
         uvconfig = setup_server(config)
+        print_multi_startup_banner(config)
         logger.info("Multi-handler server configuration complete.")
         logger.info("Starting Uvicorn server...")
         server = uvicorn.Server(uvconfig)

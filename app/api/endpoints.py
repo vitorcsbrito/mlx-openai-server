@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import suppress
 from http import HTTPStatus
 import json
 import os
 import random
 import time
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,6 +21,7 @@ from openai.types.responses import FunctionTool
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_message import ResponseOutputMessage, ResponseOutputText
 from openai.types.responses.response_reasoning_item import Content, ResponseReasoningItem, Summary
+from starlette.requests import ClientDisconnect
 
 from ..schemas.openai import (
     ChatCompletionChunk,
@@ -48,6 +51,10 @@ from ..schemas.openai import (
     Model,
     ModelsResponse,
     OutputTokensDetails,
+    RerankRequest,
+    RerankResponse,
+    RerankResult,
+    RerankResultDocument,
     ResponsesRequest,
     ResponsesResponse,
     ResponseUsage,
@@ -82,7 +89,7 @@ def _get_handler_type(handler: Any) -> str:
     -------
     str
         Handler type string (``"lm"``, ``"multimodal"``, ``"embeddings"``,
-        ``"image"``, ``"whisper"``), or ``""`` if not determinable.
+        ``"rerank"``, ``"image"``, ``"whisper"``), or ``""`` if not determinable.
     """
     return getattr(handler, "handler_type", "")
 
@@ -180,12 +187,75 @@ async def _resolve_handler(
 
 
 async def _release_on_demand(raw_request: Request) -> None:
-    """Release the on-demand model reference after a request completes."""
+    """Release the on-demand model reference after a request completes.
+
+    For streaming responses the release is deferred to the end of the stream
+    by :func:`_attach_on_demand_release`; in that case this is a no-op so the
+    reference is not dropped while tokens are still being generated.
+    """
+    if getattr(raw_request.state, "on_demand_release_deferred", False):
+        return
     model_id = getattr(raw_request.state, "on_demand_model_id", None)
     if model_id is not None:
         registry = getattr(raw_request.app.state, "registry", None)
         if registry is not None:
             await registry.release_on_demand(model_id)
+
+
+ResponseT = TypeVar("ResponseT")
+
+
+def _attach_on_demand_release(raw_request: Request, response: ResponseT) -> ResponseT:
+    """Defer the on-demand release until a streaming response is fully sent.
+
+    A :class:`~fastapi.responses.StreamingResponse` is returned from the
+    endpoint *before* its body iterator has produced any tokens, so the
+    endpoint's ``finally`` block would otherwise release the on-demand
+    reference immediately and start the idle-unload timer while generation is
+    still in progress.  For streaming responses this wraps the body iterator so
+    the reference is only released once the stream has been fully consumed (or
+    the client disconnects / errors), keeping the model loaded for the lifetime
+    of the request.
+
+    Non-streaming responses are returned unchanged; the caller's ``finally``
+    releases them immediately.
+
+    Parameters
+    ----------
+    raw_request : Request
+        The incoming request, tagged with ``on_demand_model_id`` when the
+        handler was loaded on demand.
+    response : ResponseT
+        The response about to be returned from the endpoint.
+
+    Returns
+    -------
+    ResponseT
+        The same response object, with its body iterator wrapped when it is a
+        streaming response backed by an on-demand model.
+    """
+    model_id = getattr(raw_request.state, "on_demand_model_id", None)
+    if model_id is None or not isinstance(response, StreamingResponse):
+        return response
+
+    registry = getattr(raw_request.app.state, "registry", None)
+    if registry is None:
+        return response
+
+    # Suppress the endpoint's immediate ``finally`` release; the wrapper below
+    # owns the release once the stream is exhausted.
+    raw_request.state.on_demand_release_deferred = True
+    original_iterator = response.body_iterator
+
+    async def _release_after_stream() -> AsyncGenerator[Any, None]:
+        try:
+            async for chunk in original_iterator:
+                yield chunk
+        finally:
+            await registry.release_on_demand(model_id)
+
+    response.body_iterator = _release_after_stream()
+    return response
 
 
 def _get_handler_registry_ownership(raw_request: Request, handler: Any) -> str:
@@ -555,6 +625,20 @@ def refine_chat_completion_request(
             "DEFAULT_REPETITION_CONTEXT_SIZE",
             _parse_env_int,
         )
+    if request.presence_context_size is None:
+        request.presence_context_size = _get_sampling_default(
+            handler,
+            "default_presence_context_size",
+            "DEFAULT_PRESENCE_CONTEXT_SIZE",
+            _parse_env_int,
+        )
+    if request.frequency_context_size is None:
+        request.frequency_context_size = _get_sampling_default(
+            handler,
+            "default_frequency_context_size",
+            "DEFAULT_FREQUENCY_CONTEXT_SIZE",
+            _parse_env_int,
+        )
     if not request.model:
         request.model = Config.TEXT_MODEL
     return request
@@ -616,8 +700,24 @@ async def chat_completions(
 
         try:
             if handler_type == "multimodal":
-                return await process_multimodal_request(handler, request, request_id)
-            return await process_text_request(handler, request, request_id)
+                response = await process_multimodal_request(
+                    handler, request, request_id, raw_request=raw_request
+                )
+            else:
+                response = await process_text_request(
+                    handler, request, request_id, raw_request=raw_request
+                )
+            return _attach_on_demand_release(raw_request, response)
+        except ClientDisconnect:
+            # The client (e.g. an agent cancelling the request) closed the
+            # connection; generation was already cancelled in the guard. Return
+            # a 499 ("Client Closed Request") without noisy error logging — the
+            # response body will not reach the client anyway.
+            logger.info(f"Request aborted by client disconnect [request_id={request_id}]")
+            return JSONResponse(
+                content=create_error_response("Client closed request", "client_disconnect", 499),
+                status_code=499,
+            )
         except HTTPException:
             raise
         except Exception as e:
@@ -665,6 +765,53 @@ async def embeddings(
             raise
         except Exception as e:
             logger.exception(f"Error processing embedding request: {type(e).__name__}: {e}")
+            return JSONResponse(
+                content=create_error_response(str(e)), status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+    finally:
+        await _release_on_demand(raw_request)
+
+
+@router.post("/v1/rerank", response_model=None)
+async def rerank(request: RerankRequest, raw_request: Request) -> RerankResponse | JSONResponse:
+    """Handle rerank requests."""
+    handler = await _resolve_handler(raw_request, model_id=request.model)
+    if handler is None:
+        return JSONResponse(
+            content=create_error_response(
+                "Model handler not initialized",
+                "service_unavailable",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ),
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    try:
+        _normalize_request_model(raw_request, request, handler)
+        if _get_handler_type(handler) != "rerank":
+            return JSONResponse(
+                content=create_error_response(
+                    "Unsupported model type for rerank. "
+                    f"Handler for '{request.model}' is {type(handler).__name__}.",
+                    "unsupported_request",
+                    HTTPStatus.BAD_REQUEST,
+                ),
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
+        try:
+            scores = await handler.generate_rerank_response(request)
+            return create_response_rerank(
+                scores,
+                request.documents,
+                request.model,
+                top_n=request.top_n,
+                return_documents=request.return_documents,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception(f"Error processing rerank request: {type(e).__name__}: {e}")
             return JSONResponse(
                 content=create_error_response(str(e)), status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
@@ -782,14 +929,17 @@ async def create_audio_transcriptions(
         if request.stream:
             # procoess the request before sending to the handler
             request_data = await handler.prepare_transcription_request(request)
-            return StreamingResponse(
-                handler.generate_transcription_stream_from_data(request_data),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
+            return _attach_on_demand_release(
+                raw_request,
+                StreamingResponse(
+                    handler.generate_transcription_stream_from_data(request_data),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                ),
             )
         transcription_response: (
             TranscriptionResponse | str
@@ -839,6 +989,48 @@ def create_response_embeddings(
         else:
             embeddings_response.append(EmbeddingResponseData(embedding=embedding, index=index))
     return EmbeddingResponse(object="list", data=embeddings_response, model=model, usage=None)
+
+
+def create_response_rerank(
+    scores: list[float],
+    documents: list[str],
+    model: str,
+    *,
+    top_n: int | None = None,
+    return_documents: bool = False,
+) -> RerankResponse:
+    """Create a rerank response from per-document scores.
+
+    Parameters
+    ----------
+    scores : list[float]
+        Relevance scores, aligned with ``documents``.
+    documents : list[str]
+        The candidate documents that were scored.
+    model : str
+        Model name used for reranking.
+    top_n : int | None, optional
+        Truncate to the ``top_n`` highest-scoring results, by default all.
+    return_documents : bool, optional
+        Echo the document text in each result, by default False.
+
+    Returns
+    -------
+    RerankResponse
+        Results sorted by descending relevance score.
+    """
+    results = [
+        RerankResult(
+            index=index,
+            relevance_score=score,
+            document=RerankResultDocument(text=documents[index]) if return_documents else None,
+        )
+        for index, score in enumerate(scores)
+    ]
+    results.sort(key=lambda r: r.relevance_score, reverse=True)
+    if top_n is not None and top_n >= 0:
+        results = results[:top_n]
+    return RerankResponse(object="list", model=model, results=results, usage=None)
 
 
 def create_response_chunk(
@@ -1057,7 +1249,10 @@ async def handle_stream_response(
 
 
 async def process_multimodal_request(
-    handler: MLXVLMHandler, request: ChatCompletionRequest, request_id: str | None = None
+    handler: MLXVLMHandler,
+    request: ChatCompletionRequest,
+    request_id: str | None = None,
+    raw_request: Request | None = None,
 ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
     """Process multimodal-specific requests."""
     if request_id:
@@ -1075,17 +1270,81 @@ async def process_multimodal_request(
                 "X-Accel-Buffering": "no",
             },
         )
-    result = await handler.generate_multimodal_response(request)
+    generation = handler.generate_multimodal_response(request)
+    if raw_request is not None:
+        result = await _await_with_disconnect_guard(raw_request, generation, request_id=request_id)
+    else:
+        result = await generation
     response_data = result.get("response")
     usage = result.get("usage")
     final_response = format_final_response(response_data, request.model, request_id, usage)
     return JSONResponse(content=final_response.model_dump(exclude_none=True))
 
 
+_T = TypeVar("_T")
+
+
+async def _await_with_disconnect_guard(
+    raw_request: Request,
+    awaitable: Awaitable[_T],
+    *,
+    request_id: str | None = None,
+    poll_interval: float = 0.5,
+) -> _T:
+    """Await a non-streaming generation, aborting it if the client disconnects.
+
+    Starlette only races the connection against a disconnect watcher for
+    *streaming* responses; a plain ``await handler.generate_*_response(...)``
+    keeps running on the server even after the client (for example an agent
+    that cancelled the request) has closed the socket. We poll
+    ``raw_request.is_disconnected()`` alongside the generation and cancel it on
+    disconnect, which propagates cancellation into the batch scheduler /
+    inference worker so generation actually stops.
+
+    Parameters
+    ----------
+    raw_request : Request
+        The live request, used to detect client disconnects.
+    awaitable : Awaitable[_T]
+        The generation coroutine to run.
+    request_id : str | None
+        Identifier used for logging.
+    poll_interval : float
+        Seconds between disconnect polls while awaiting the result.
+
+    Returns
+    -------
+    _T
+        The result of ``awaitable`` when it completes before any disconnect.
+
+    Raises
+    ------
+    ClientDisconnect
+        If the client closes the connection before generation finishes.
+    """
+    task: asyncio.Task[_T] = asyncio.ensure_future(awaitable)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll_interval)
+            if task in done:
+                return task.result()
+            if await raw_request.is_disconnected():
+                logger.info(
+                    f"Client disconnected; cancelling in-flight request [request_id={request_id}]"
+                )
+                raise ClientDisconnect
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
 async def process_text_request(
     handler: MLXLMHandler | MLXVLMHandler,
     request: ChatCompletionRequest,
     request_id: str | None = None,
+    raw_request: Request | None = None,
 ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
     """Process text-only requests."""
     if request_id:
@@ -1107,7 +1366,11 @@ async def process_text_request(
         )
 
     # Extract response and usage from handler
-    result = await handler.generate_text_response(request)  # type: ignore[union-attr]
+    generation = handler.generate_text_response(request)  # type: ignore[union-attr]
+    if raw_request is not None:
+        result = await _await_with_disconnect_guard(raw_request, generation, request_id=request_id)
+    else:
+        result = await generation
     response_data = result.get("response")
     usage = result.get("usage")
     final_response = format_final_response(response_data, request.model, request_id, usage)
@@ -2128,8 +2391,10 @@ async def responses_endpoint(
 
         try:
             if handler_type == "multimodal":
-                return await process_multimodal_responses_request(handler, request)
-            return await process_text_responses_request(handler, request)
+                response = await process_multimodal_responses_request(handler, request)
+            else:
+                response = await process_text_responses_request(handler, request)
+            return _attach_on_demand_release(raw_request, response)
         except HTTPException:
             raise
         except Exception as e:

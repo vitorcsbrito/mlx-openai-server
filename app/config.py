@@ -39,6 +39,7 @@ class MLXServerConfig:
     host: str = "0.0.0.0"
     queue_timeout: int = 300
     queue_size: int = 100
+    rerank_batch_size: int = 8
     disable_auto_resize: bool = False
     quantize: int | None = None
     config_name: str | None = None
@@ -57,6 +58,7 @@ class MLXServerConfig:
     prompt_cache_size: int = 10
     prompt_cache_max_bytes: int = 1 << 63
     prompt_cache_dir: str | None = None
+    prompt_cache_auto_segment: bool = False
     draft_model_path: str | None = None
     num_draft_tokens: int = 2
 
@@ -80,10 +82,13 @@ class MLXServerConfig:
     default_min_p: float | None = None
     default_repetition_penalty: float | None = None
     default_presence_penalty: float | None = None
+    default_frequency_penalty: float | None = None
     default_xtc_probability: float | None = None
     default_xtc_threshold: float | None = None
     default_seed: int | None = None
     default_repetition_context_size: int | None = None
+    default_presence_context_size: int | None = None
+    default_frequency_context_size: int | None = None
 
     # Used to capture raw CLI input before processing
     lora_paths_str: str | None = None
@@ -182,6 +187,7 @@ class MLXServerConfig:
             context_length=self.context_length,
             queue_timeout=self.queue_timeout,
             queue_size=self.queue_size,
+            rerank_batch_size=self.rerank_batch_size,
             quantize=self.quantize,
             config_name=self.config_name,
             lora_paths=self.lora_paths,
@@ -197,6 +203,7 @@ class MLXServerConfig:
             prompt_cache_size=self.prompt_cache_size,
             prompt_cache_max_bytes=self.prompt_cache_max_bytes,
             prompt_cache_dir=self.prompt_cache_dir,
+            prompt_cache_auto_segment=self.prompt_cache_auto_segment,
             draft_model_path=self.draft_model_path,
             num_draft_tokens=self.num_draft_tokens,
             kv_bits=self.kv_bits,
@@ -216,10 +223,13 @@ class MLXServerConfig:
             default_min_p=self.default_min_p,
             default_repetition_penalty=self.default_repetition_penalty,
             default_presence_penalty=self.default_presence_penalty,
+            default_frequency_penalty=self.default_frequency_penalty,
             default_xtc_probability=self.default_xtc_probability,
             default_xtc_threshold=self.default_xtc_threshold,
             default_seed=self.default_seed,
             default_repetition_context_size=self.default_repetition_context_size,
+            default_presence_context_size=self.default_presence_context_size,
+            default_frequency_context_size=self.default_frequency_context_size,
         )
 
     def to_multi_model_server_config(self) -> MultiModelServerConfig:
@@ -247,7 +257,7 @@ class MLXServerConfig:
 # ---------------------------------------------------------------------------
 
 VALID_MODEL_TYPES = frozenset(
-    {"lm", "multimodal", "image-generation", "image-edit", "embeddings", "whisper"}
+    {"lm", "multimodal", "image-generation", "image-edit", "embeddings", "rerank", "whisper"}
 )
 
 
@@ -278,6 +288,9 @@ class ModelEntryConfig:
     lora_paths: list[str] | None = None
     lora_scales: list[float] | None = None
 
+    # Rerank options
+    rerank_batch_size: int = 8  # (query, document) pairs scored per forward pass
+
     # On-demand (dynamic swapping) options
     on_demand: bool = False
     on_demand_idle_timeout: int = 60  # seconds before unloading idle on-demand model
@@ -294,6 +307,7 @@ class ModelEntryConfig:
     prompt_cache_size: int = 10
     prompt_cache_max_bytes: int = 1 << 63
     prompt_cache_dir: str | None = None
+    prompt_cache_auto_segment: bool = False
     draft_model_path: str | None = None
     num_draft_tokens: int = 2
     kv_bits: int | None = None
@@ -310,10 +324,13 @@ class ModelEntryConfig:
     default_min_p: float | None = None
     default_repetition_penalty: float | None = None
     default_presence_penalty: float | None = None
+    default_frequency_penalty: float | None = None
     default_xtc_probability: float | None = None
     default_xtc_threshold: float | None = None
     default_seed: int | None = None
     default_repetition_context_size: int | None = None
+    default_presence_context_size: int | None = None
+    default_frequency_context_size: int | None = None
 
     def __post_init__(self) -> None:
         """Resolve ``served_model_name`` and validate ``model_type``."""

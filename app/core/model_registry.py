@@ -18,6 +18,51 @@ from loguru import logger
 from ..schemas.model import ModelMetadata
 
 
+def derive_capabilities(
+    model_type: str,
+    *,
+    enable_auto_tool_choice: bool = False,
+    tool_call_parser: str | None = None,
+    reasoning_parser: str | None = None,
+) -> dict[str, bool]:
+    """Derive a model's capability flags from its type and parser config.
+
+    The flags describe what a client can do with the model without needing
+    out-of-band knowledge. Type-based flags are exact; ``tools`` and
+    ``reasoning`` are inferred from whether the corresponding parsers are
+    configured for the model.
+
+    Parameters
+    ----------
+    model_type : str
+        Model type (``lm``, ``multimodal``, ``embeddings``, ``rerank``, ``whisper``,
+        ``image-generation``, ``image-edit``).
+    enable_auto_tool_choice : bool, optional
+        Whether automatic tool-choice is enabled for the model.
+    tool_call_parser : str | None, optional
+        Name of the configured tool-call parser, if any.
+    reasoning_parser : str | None, optional
+        Name of the configured reasoning parser, if any.
+
+    Returns
+    -------
+    dict[str, bool]
+        Capability flags keyed by capability name.
+    """
+    is_text = model_type in ("lm", "multimodal")
+    return {
+        "text_generation": is_text,
+        "streaming": is_text,
+        "vision": model_type == "multimodal",
+        "audio_transcription": model_type == "whisper",
+        "embeddings": model_type == "embeddings",
+        "rerank": model_type == "rerank",
+        "image_generation": model_type in ("image-generation", "image-edit"),
+        "tools": is_text and bool(enable_auto_tool_choice or tool_call_parser),
+        "reasoning": is_text and bool(reasoning_parser),
+    }
+
+
 class ModelRegistry:
     """Registry for managing model handlers.
 
@@ -57,6 +102,10 @@ class ModelRegistry:
         handler: Any,
         model_type: str,
         context_length: int | None = None,
+        *,
+        enable_auto_tool_choice: bool = False,
+        tool_call_parser: str | None = None,
+        reasoning_parser: str | None = None,
     ) -> None:
         """Register a model handler with metadata.
 
@@ -70,6 +119,13 @@ class ModelRegistry:
             Type of model (``lm``, ``multimodal``, ``embeddings``, etc.).
         context_length : int | None, optional
             Maximum context length (if applicable).
+        enable_auto_tool_choice : bool, optional
+            Whether automatic tool-choice is enabled (drives the ``tools``
+            capability flag).
+        tool_call_parser : str | None, optional
+            Configured tool-call parser name (drives the ``tools`` flag).
+        reasoning_parser : str | None, optional
+            Configured reasoning parser name (drives the ``reasoning`` flag).
 
         Raises
         ------
@@ -85,6 +141,12 @@ class ModelRegistry:
                 type=model_type,
                 context_length=context_length,
                 created_at=int(time.time()),
+                capabilities=derive_capabilities(
+                    model_type,
+                    enable_auto_tool_choice=enable_auto_tool_choice,
+                    tool_call_parser=tool_call_parser,
+                    reasoning_parser=reasoning_parser,
+                ),
             )
 
             self._handlers[model_id] = handler
@@ -126,20 +188,38 @@ class ModelRegistry:
     def list_models(self) -> list[dict[str, Any]]:
         """List all registered models with metadata.
 
+        The OpenAI-standard fields (``id``, ``object``, ``created``,
+        ``owned_by``) are always present. The additive ``metadata`` field
+        carries capability flags and on-demand lifecycle state so clients can
+        select a model and operators can see whether it is currently resident
+        in memory. ``resident`` reflects a point-in-time snapshot. Transient
+        runtime metrics (request concurrency, queue depth) are intentionally
+        excluded here — see ``/v1/queue/stats`` for those.
+
         Returns
         -------
         list[dict[str, Any]]
             List of model metadata dicts in OpenAI API format.
         """
-        return [
-            {
-                "id": metadata.id,
-                "object": metadata.object,
-                "created": metadata.created_at,
-                "owned_by": metadata.owned_by,
-            }
-            for metadata in self._metadata.values()
-        ]
+        models: list[dict[str, Any]] = []
+        for metadata in self._metadata.values():
+            model_id = metadata.id
+            models.append(
+                {
+                    "id": model_id,
+                    "object": metadata.object,
+                    "created": metadata.created_at,
+                    "owned_by": metadata.owned_by,
+                    "metadata": {
+                        "type": metadata.type,
+                        "context_length": metadata.context_length,
+                        "capabilities": metadata.capabilities,
+                        "on_demand": model_id in self._on_demand_configs,
+                        "resident": model_id in self._handlers,
+                    },
+                }
+            )
+        return models
 
     def get_metadata(self, model_id: str) -> ModelMetadata:
         """Get metadata for a specific model.
@@ -313,12 +393,22 @@ class ModelRegistry:
             }
             self._on_demand_idle_timeouts[model_id] = idle_timeout
 
-            # Add metadata so the model appears in /v1/models
+            # Add metadata so the model appears in /v1/models. Capability
+            # flags are derived from the serialized config dict, which mirrors
+            # the CLI/YAML fields for this model.
             self._metadata[model_id] = ModelMetadata(
                 id=model_id,
                 type=model_type,
                 context_length=context_length,
                 created_at=int(time.time()),
+                capabilities=derive_capabilities(
+                    model_type,
+                    enable_auto_tool_choice=bool(
+                        model_cfg_dict.get("enable_auto_tool_choice", False)
+                    ),
+                    tool_call_parser=model_cfg_dict.get("tool_call_parser"),
+                    reasoning_parser=model_cfg_dict.get("reasoning_parser"),
+                ),
             )
 
             logger.info(
@@ -333,9 +423,13 @@ class ModelRegistry:
     async def ensure_on_demand_loaded(self, model_id: str) -> Any:
         """Load an on-demand model if not already loaded.
 
-        If a different on-demand model is currently loaded and idle,
-        it will be unloaded first.  Only one on-demand model is kept
-        in memory at a time.
+        Loading a not-yet-resident on-demand model evicts other on-demand
+        models that are currently idle (``ref_count == 0``) to free memory.
+        On-demand peers that still have in-flight requests are kept loaded
+        alongside the new one until their own requests drain, so more than
+        one on-demand model can be resident at a time; the set converges back
+        to one as idle peers are evicted on the next load or by their own
+        idle-unload timers. Always-on models are never evicted by this path.
 
         Parameters
         ----------

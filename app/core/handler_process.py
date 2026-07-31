@@ -256,7 +256,20 @@ def _handler_worker(
     import mlx.core as mx
 
     from app.config import ModelEntryConfig
-    from app.server import create_handler_from_config
+    from app.server import configure_logging, create_handler_from_config
+
+    # loguru configuration does not survive ``spawn`` — reconstruct the same
+    # sinks here so child logs (model load, inference, per-request errors)
+    # reach the configured log file and honour the requested log level
+    # instead of falling back to loguru's default stderr-only handler.
+    # Rotation is left to the parent to avoid multiple processes racing to
+    # rotate a shared file.
+    configure_logging(
+        log_file=queue_config.get("log_file"),
+        no_log_file=queue_config.get("no_log_file", False),
+        log_level=queue_config.get("log_level", "INFO"),
+        enable_rotation=False,
+    )
 
     # Remember the parent PID so the request loop can detect if the
     # parent dies unexpectedly (e.g. SIGKILL).  Because we use the
@@ -456,7 +469,7 @@ class HandlerProcessProxy:
         Unique model identifier in the registry.
     handler_type : str
         Handler type string (``"lm"``, ``"multimodal"``, ``"embeddings"``,
-        ``"image"``, ``"whisper"``).
+        ``"rerank"``, ``"image"``, ``"whisper"``).
     model_created : int
         Unix timestamp when the handler process was started.
     """
@@ -466,6 +479,7 @@ class HandlerProcessProxy:
         "lm": "lm",
         "multimodal": "multimodal",
         "embeddings": "embeddings",
+        "rerank": "rerank",
         "image-generation": "image",
         "image-edit": "image",
         "whisper": "whisper",
@@ -478,10 +492,13 @@ class HandlerProcessProxy:
         "default_min_p",
         "default_repetition_penalty",
         "default_presence_penalty",
+        "default_frequency_penalty",
         "default_xtc_probability",
         "default_xtc_threshold",
         "default_seed",
         "default_repetition_context_size",
+        "default_presence_context_size",
+        "default_frequency_context_size",
     )
 
     def __init__(
@@ -1159,6 +1176,23 @@ class HandlerProcessProxy:
             Embeddings result (list of lists of floats).
         """
         return await self._call("generate_embeddings_response", request)
+
+    # -- Rerank handler methods --
+
+    async def generate_rerank_response(self, request: Any) -> Any:
+        """Forward a rerank request to the subprocess.
+
+        Parameters
+        ----------
+        request : RerankRequest
+            The rerank request.
+
+        Returns
+        -------
+        Any
+            One relevance score per document, in input order.
+        """
+        return await self._call("generate_rerank_response", request)
 
     # -- Image generation handler methods --
 

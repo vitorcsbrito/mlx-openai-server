@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Callable, Generator
 from contextlib import nullcontext
 import queue
+import sys
 import threading
 from threading import Thread
 from typing import Any
@@ -13,6 +14,23 @@ from typing import Any
 from loguru import logger
 
 _SENTINEL = object()
+
+
+def _clear_mlx_cache() -> None:
+    """Trim MLX's buffer cache to reclaim GPU memory after a failed or abandoned request.
+
+    Uses the already-imported ``mlx.core`` module if present so this is a
+    no-op in processes that never loaded MLX. ``mx.clear_cache()`` only frees
+    buffers that are not currently in use, so it is safe to call while other
+    work is in flight.
+    """
+    mx = sys.modules.get("mlx.core")
+    if mx is None:
+        return
+    try:
+        mx.clear_cache()
+    except Exception as exc:  # noqa: BLE001 - cache trimming is best-effort
+        logger.warning(f"Inference worker failed to clear MLX cache: {exc!s}")
 
 
 def _resolve_future(
@@ -121,15 +139,23 @@ class InferenceWorker:
         """Run func on the worker thread; await its result. Raises QueueFull, TimeoutError, or func's exception."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
+        cancel_event = threading.Event()
 
         def _work() -> None:
             try:
                 out = func(*args, **kwargs)
+                if cancel_event.is_set():
+                    # Caller already gave up (timeout/disconnect). Drop the stale
+                    # result and reclaim the GPU memory it allocated so it does
+                    # not stack up against the next request.
+                    _clear_mlx_cache()
+                    return
                 loop.call_soon_threadsafe(_resolve_future, future, out, None)
                 self._record(True)
             except BaseException as e:
                 loop.call_soon_threadsafe(_resolve_future, future, None, e)
                 self._record(False)
+                _clear_mlx_cache()
 
         try:
             self._work_queue.put_nowait(_work)
@@ -138,6 +164,7 @@ class InferenceWorker:
         try:
             return await asyncio.wait_for(future, timeout=self._timeout)
         except TimeoutError:
+            cancel_event.set()
             raise TimeoutError(f"Inference timed out after {self._timeout}s")
 
     def submit_stream(
@@ -153,16 +180,20 @@ class InferenceWorker:
 
         def _work() -> None:
             gen: Generator[Any, None, None] | None = None
+            cancelled = False
+            failed = False
             try:
                 gen = func(*args, **kwargs)
                 for item in gen:
                     if cancel_event.is_set():
                         logger.info("Inference generation cancelled (client disconnect)")
+                        cancelled = True
                         break
                     loop.call_soon_threadsafe(token_queue.put_nowait, item)
                 loop.call_soon_threadsafe(token_queue.put_nowait, _SENTINEL)
                 self._record(True)
             except BaseException as e:
+                failed = True
                 loop.call_soon_threadsafe(token_queue.put_nowait, e)
                 self._record(False)
             finally:
@@ -171,6 +202,10 @@ class InferenceWorker:
                         gen.close()
                     except Exception as exc:  # noqa: BLE001 - close is best-effort cleanup
                         logger.warning(f"Inference stream cleanup failed: {exc!s}")
+                # A cancelled or failed stream leaves partial KV-cache allocations
+                # behind; trim the MLX buffer cache so they do not accumulate.
+                if cancelled or failed:
+                    _clear_mlx_cache()
 
         try:
             self._work_queue.put_nowait(_work)

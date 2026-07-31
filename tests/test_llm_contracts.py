@@ -217,12 +217,13 @@ class TestLLMContract:
         # Build detailed status message
         if model_id:
             assert status in ["ok", "healthy", "ready"]  # Basic health check
-            assert model_status in [
-                "loaded",
-                "ready",
-                "ok",
-                "unknown",
-            ]  # Model status can vary
+            # `endpoints.py` reports "initialized" for a single handler and
+            # "initialized (N model(s))" from the registry. The unhealthy
+            # statuses ("no_models", "uninitialized") ship with a 503, which
+            # the status_code assertion above has already ruled out.
+            assert model_status.startswith("initialized"), (
+                f"Unexpected model_status: {model_status!r}"
+            )
         else:
             assert status in ["ok", "healthy", "ready"]
 
@@ -241,13 +242,16 @@ class TestLLMContract:
         model_list = ModelList.model_validate(payload)
         assert len(model_list.data) > 0, "Model registry returned an empty list"
 
-        # Verify metadata presence and required fields (Phase 02)
+        # Verify metadata presence and required fields (Phase 02).
+        # `ModelRegistry.list_models` is the only source of this dict, so these
+        # five keys are the whole contract — there is no `backend` field.
         raw_model = payload["data"][0]  # Get raw dict for metadata check
         if "metadata" in raw_model:
             metadata = raw_model["metadata"]
-            assert "context_length" in metadata, "Model metadata missing 'context_length' field"
-            assert metadata.get("backend") == "mlx", (
-                f"Expected backend='mlx', got '{metadata.get('backend')}'"
+            for field in ("type", "context_length", "capabilities", "on_demand", "resident"):
+                assert field in metadata, f"Model metadata missing '{field}' field"
+            assert isinstance(metadata["capabilities"], dict), (
+                f"Expected capabilities to be a dict, got {type(metadata['capabilities'])}"
             )
 
     @pytest.mark.integration

@@ -30,6 +30,10 @@ DEFAULT_REPETITION_PENALTY = float(os.getenv("DEFAULT_REPETITION_PENALTY", "0.0"
 DEFAULT_REPETITION_CONTEXT_SIZE = int(os.getenv("DEFAULT_REPETITION_CONTEXT_SIZE", "20"))
 DEFAULT_PRESENCE_PENALTY = float(os.getenv("DEFAULT_PRESENCE_PENALTY", "0.0"))
 DEFAULT_FREQUENCY_PENALTY = float(os.getenv("DEFAULT_FREQUENCY_PENALTY", "0.0"))
+# Every penalty only inspects the last N tokens, so a window under one loop
+# cycle cannot see paragraph-scale repetition. mlx_lm's own default is 20.
+DEFAULT_PRESENCE_CONTEXT_SIZE = int(os.getenv("DEFAULT_PRESENCE_CONTEXT_SIZE", "20"))
+DEFAULT_FREQUENCY_CONTEXT_SIZE = int(os.getenv("DEFAULT_FREQUENCY_CONTEXT_SIZE", "20"))
 
 
 def _as_int_set(values: Any) -> set[int]:
@@ -359,7 +363,11 @@ class MLX_LM:
                 "repetition_context_size", DEFAULT_REPETITION_CONTEXT_SIZE
             ),
             "presence_penalty": _get("presence_penalty", DEFAULT_PRESENCE_PENALTY),
+            "presence_context_size": _get("presence_context_size", DEFAULT_PRESENCE_CONTEXT_SIZE),
             "frequency_penalty": _get("frequency_penalty", DEFAULT_FREQUENCY_PENALTY),
+            "frequency_context_size": _get(
+                "frequency_context_size", DEFAULT_FREQUENCY_CONTEXT_SIZE
+            ),
             "xtc_probability": _get("xtc_probability", DEFAULT_XTC_PROBABILITY),
             "xtc_threshold": _get("xtc_threshold", DEFAULT_XTC_THRESHOLD),
             "eos_token_ids": sorted(_as_int_set(getattr(self.tokenizer, "eos_token_ids", None))),
@@ -423,9 +431,21 @@ class MLX_LM:
         repetition_penalty = _penalty_value("repetition_penalty", DEFAULT_REPETITION_PENALTY)
         presence_penalty = _penalty_value("presence_penalty", DEFAULT_PRESENCE_PENALTY)
         frequency_penalty = _penalty_value("frequency_penalty", DEFAULT_FREQUENCY_PENALTY)
-        repetition_context_size = params.get("repetition_context_size")
-        if repetition_context_size is None:
-            repetition_context_size = DEFAULT_REPETITION_CONTEXT_SIZE
+        def _context_size(key: str, default: int) -> int:
+            value = params.get(key)
+            if value is None:
+                value = self._sampling_default(key, default)
+            return default if value is None else value
+
+        repetition_context_size = _context_size(
+            "repetition_context_size", DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        presence_context_size = _context_size(
+            "presence_context_size", DEFAULT_PRESENCE_CONTEXT_SIZE
+        )
+        frequency_context_size = _context_size(
+            "frequency_context_size", DEFAULT_FREQUENCY_CONTEXT_SIZE
+        )
 
         processors: list[Any] = list(
             make_logits_processors(
@@ -433,7 +453,9 @@ class MLX_LM:
                 repetition_penalty=repetition_penalty,
                 repetition_context_size=repetition_context_size,
                 presence_penalty=presence_penalty,
+                presence_context_size=presence_context_size,
                 frequency_penalty=frequency_penalty,
+                frequency_context_size=frequency_context_size,
             )
         )
 
@@ -511,6 +533,10 @@ class MLX_LM:
             - ``checkpoint_callback`` (callable | None): Called with the
               prompt cache after processing the prefix so the caller can
               persist a checkpoint.
+            - ``checkpoints`` (list[tuple[int, callable]] | None): Multiple
+              ``(position, callback)`` checkpoints fired in ascending order
+              during a single prefill. Supersedes the single
+              ``checkpoint_position`` / ``checkpoint_callback`` pair.
 
         Returns
         -------
@@ -519,16 +545,35 @@ class MLX_LM:
         """
         checkpoint_position: int | None = kwargs.pop("checkpoint_position", None)
         checkpoint_callback = kwargs.pop("checkpoint_callback", None)
+        # Optional multi-checkpoint list: ``[(position, callback), ...]`` with
+        # positions relative to ``input_ids``. Generalizes the single
+        # checkpoint above so non-trimmable caches can snapshot state at every
+        # role boundary during one prefill pass.
+        checkpoints: list[tuple[int, Any]] | None = kwargs.pop("checkpoints", None)
 
+        # Normalize the single-checkpoint form into the list form so both
+        # follow one code path.
         if (
-            checkpoint_position is not None
+            checkpoints is None
+            and checkpoint_position is not None
             and checkpoint_callback is not None
-            and prompt_cache is not None
-            and 0 < checkpoint_position < len(input_ids)
         ):
-            self._prefill_cache(input_ids[:checkpoint_position], prompt_cache)
-            checkpoint_callback(prompt_cache)
-            input_ids = input_ids[checkpoint_position:]
+            checkpoints = [(checkpoint_position, checkpoint_callback)]
+
+        if checkpoints and prompt_cache is not None:
+            # Prefill segment-by-segment, firing each callback once its prefix
+            # has been processed. Positions must be ascending and strictly
+            # inside the prompt (the final token is always left for decoding).
+            valid = sorted((pos, cb) for pos, cb in checkpoints if 0 < pos < len(input_ids))
+            prev = 0
+            for pos, cb in valid:
+                if pos <= prev:
+                    continue
+                self._prefill_cache(input_ids[prev:pos], prompt_cache)
+                cb(prompt_cache)
+                prev = pos
+            if prev > 0:
+                input_ids = input_ids[prev:]
 
         def _get(key, default):
             v = kwargs.get(key)
@@ -562,6 +607,8 @@ class MLX_LM:
         if frequency_penalty == 0:
             frequency_penalty = None
         repetition_context_size = _get("repetition_context_size", DEFAULT_REPETITION_CONTEXT_SIZE)
+        presence_context_size = _get("presence_context_size", DEFAULT_PRESENCE_CONTEXT_SIZE)
+        frequency_context_size = _get("frequency_context_size", DEFAULT_FREQUENCY_CONTEXT_SIZE)
         logit_bias = kwargs.get("logit_bias")
 
         # Convert string keys to int if logit_bias is provided (OpenAI API uses string keys)
@@ -573,7 +620,9 @@ class MLX_LM:
             repetition_penalty=repetition_penalty,
             repetition_context_size=repetition_context_size,
             presence_penalty=presence_penalty,
+            presence_context_size=presence_context_size,
             frequency_penalty=frequency_penalty,
+            frequency_context_size=frequency_context_size,
         )
 
         json_schema = kwargs.get("schema")

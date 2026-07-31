@@ -23,19 +23,22 @@ classifiers = [
 
 dependencies = [
   "aiofiles>=25,<26",
+  "aiohttp>=3.13,<4",
   "av>=16.0.1,<17",
   "click>=8.2.1,<8.4",
   "dill>=0.4,<0.5",
-  "fastapi>=0.115.14,<0.130",
+  "fastapi>=0.130,<0.142",
   "httpx>=0.28,<1",
   "json_repair>=0.52.1,<0.60",
   "librosa>=0.11.0,<0.12",
   "loguru>=0.7.3,<0.8",
-  "mlx-embeddings>=0.0.5,<0.1",
+  # >=0.1.0 for the qwen3_vl reranker (Model.rerank) behind /v1/rerank.
+  "mlx-embeddings>=0.1.0,<0.2",
   "mlx-lm>=0.31.3,<0.32",
-  "mlx-vlm>=0.4.4,<0.5",
+  # >=0.6.2 for qwen3_5_moe_vision (Qwen3.5/3.6 MoE VL)
+  "mlx-vlm>=0.6.8,<0.7",
   "mlx-whisper>=0.4.3,<0.5",
-  "mlx>=0.31.2",
+  "mlx>=0.32.0",
   "numpy>=2.2.0,<2.4",
   "openai>=2.21,<3",
   "openai-harmony>=0.0.8,<0.1",
@@ -46,11 +49,13 @@ dependencies = [
   "python-multipart>=0.0.20,<0.0.25",
   "rich>=14,<15",
   "torchvision>=0.23.0,<0.30",
-  "mflux>=0.17.4,<0.18",
   "uvicorn>=0.35.0,<0.40",
   "xxhash>=3.6,<4",
+  "transformers>=5.14.0,<6"
 ]
 
+# mflux dropped: it caps mlx<0.32, which mlx-vlm>=0.6.5 forbids. Image gen is
+# already optional at runtime (app/server.py probes for it) — install separately.
 [dependency-groups]
 dev = [
   "codespell",
@@ -90,6 +95,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.uv]
 prerelease = "allow"
+# This is an Apple-Silicon MLX server; only resolve/lock for macOS. Without
+# this, uv resolves for Linux too, where mflux pins mlx[cuda13]<=0.31.1 and
+# conflicts with our mlx>=0.31.2 requirement (an unsatisfiable, irrelevant env).
+environments = ["sys_platform == 'darwin'"]
 
 [tool.codespell]
 skip = "*.py,*.toml,*.ipynb"

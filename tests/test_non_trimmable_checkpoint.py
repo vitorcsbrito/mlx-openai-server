@@ -475,6 +475,58 @@ class TestModelCheckpointPrefill:
 
         model._prefill_cache.assert_not_called()
 
+    def test_multiple_checkpoints_prefill_incrementally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``checkpoints`` list prefills each segment in turn and fires each callback."""
+        model, fake_generate = self._make_model(monkeypatch)
+
+        input_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        fake_cache = [Mock(state=[]), Mock(state=[])]
+        fired: list[int] = []
+
+        model(
+            input_ids,
+            prompt_cache=fake_cache,
+            stream=False,
+            checkpoints=[
+                (3, lambda _c: fired.append(3)),
+                (5, lambda _c: fired.append(5)),
+            ],
+        )
+
+        # Prefill advances segment-by-segment: [1,2,3] then [4,5].
+        prefill_chunks = [list(call.args[0]) for call in model._prefill_cache.call_args_list]
+        assert prefill_chunks == [[1, 2, 3], [4, 5]]
+        # Both callbacks fired in order.
+        assert fired == [3, 5]
+        # Generation receives only the suffix after the last checkpoint.
+        assert list(fake_generate.stream_generate.call_args[0][2]) == [6, 7, 8]
+
+    def test_checkpoints_supersede_single_checkpoint_pair(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When both are supplied, the ``checkpoints`` list takes precedence."""
+        model, fake_generate = self._make_model(monkeypatch)
+
+        input_ids = [1, 2, 3, 4, 5, 6]
+        fake_cache = [Mock(state=[]), Mock(state=[])]
+        single_fired: list[int] = []
+
+        model(
+            input_ids,
+            prompt_cache=fake_cache,
+            stream=False,
+            checkpoint_position=2,
+            checkpoint_callback=lambda _c: single_fired.append(2),
+            checkpoints=[(4, lambda _c: None)],
+        )
+
+        # The single pair is ignored; only the list boundary at 4 is used.
+        assert single_fired == []
+        assert [list(c.args[0]) for c in model._prefill_cache.call_args_list] == [[1, 2, 3, 4]]
+        assert list(fake_generate.stream_generate.call_args[0][2]) == [5, 6]
+
 
 # ---------------------------------------------------------------------------
 # _build_inference_context: checkpoint on shorter cache hits

@@ -15,7 +15,12 @@ from ..core import BatchScheduler, InferenceWorker
 from ..core.batch_scheduler import BATCHING_AVAILABLE
 from ..message_converters import MessageConverterManager
 from ..parsers import ParserManager, ReasoningParserState, ToolParserState
-from ..schemas.openai import ChatCompletionRequest, PromptTokenUsageInfo, UsageInfo
+from ..schemas.openai import (
+    ChatCompletionRequest,
+    CompletionTimingsInfo,
+    PromptTokenUsageInfo,
+    UsageInfo,
+)
 from ..utils.debug_logging import (
     log_debug_cache_stats,
     log_debug_model_dispatch,
@@ -86,6 +91,66 @@ def _strip_complete_tool_blocks(text: str, tool_open: str, tool_close: str) -> s
     return "".join(pieces)
 
 
+def _recover_misplaced_tool_calls(
+    parsed_response: dict[str, Any],
+    tool_parser: Any,
+    *,
+    debug: bool = False,
+) -> None:
+    """Recover tool-call blocks the model emitted inside the reasoning span.
+
+    Non fine-tuned models sometimes "think out loud" and emit a complete
+    ``<tool_call>...</tool_call>`` block inside the reasoning span.
+    ``extract_reasoning`` swallows everything between the reasoning open/close
+    tags into ``reasoning_content``, so the tool parser (which only sees the
+    post-reasoning tail) would otherwise drop that call. This rescans the
+    reasoning text and promotes any recovered calls, stripping them out of the
+    reasoning content. It mutates ``parsed_response`` in place and only acts as a
+    fallback when no tool calls were recovered from the post-reasoning content,
+    so models that behave correctly are unaffected.
+
+    Parameters
+    ----------
+    parsed_response : dict[str, Any]
+        Parsed response dict with ``reasoning_content`` and ``tool_calls`` keys.
+    tool_parser : Any
+        Tool parser exposing ``extract_tool_calls``/``get_tool_open``/``get_tool_close``.
+    debug : bool, optional
+        When True, emit a parser debug event for the recovery, by default False.
+    """
+    reasoning_text = parsed_response.get("reasoning_content")
+    if (
+        tool_parser is None
+        or parsed_response.get("tool_calls")
+        or not isinstance(reasoning_text, str)
+        or tool_parser.get_tool_open() not in reasoning_text
+    ):
+        return
+
+    recovered_content = tool_parser.extract_tool_calls(reasoning_text)
+    recovered_calls = recovered_content.get("tool_calls") if recovered_content else None
+    if not recovered_calls:
+        return
+
+    if debug:
+        log_debug_parser_event(
+            component="mlx_lm.nonstream.tool.selfheal",
+            chunk_index=0,
+            phase="recover-from-reasoning",
+            parser=tool_parser,
+            text=reasoning_text,
+            parsed_content=recovered_content,
+            is_complete=True,
+        )
+    parsed_response["tool_calls"] = recovered_calls
+    cleaned_reasoning = _strip_complete_tool_blocks(
+        reasoning_text,
+        tool_parser.get_tool_open(),
+        tool_parser.get_tool_close(),
+    )
+    parsed_response["reasoning_content"] = cleaned_reasoning or None
+
+
 @dataclass
 class _InferenceContext:
     """Pre-processed inference state shared by stream and non-stream paths."""
@@ -100,11 +165,20 @@ class _InferenceContext:
     prompt_progress_callback: Any = None
     checkpoint_position: int | None = None
     checkpoint_callback: Any = None
+    # Multiple ``(relative_position, callback)`` prefill checkpoints used by the
+    # non-batched path when auto-segmentation is enabled on a non-trimmable
+    # cache. Supersedes the single ``checkpoint_position`` pair when set.
+    checkpoints: list[tuple[int, Any]] | None = None
     # Optional segmentation used by the batched path for non-trimmable cache
     # models: splits ``rest_input_ids`` at a useful boundary so the scheduler
     # can save a prefix checkpoint during prefill.
     batched_segments: list[list[int]] | None = None
     batched_segment_types: list[str] | None = None
+    # Auto-segmentation: ascending (token_offset, role) role-change boundaries
+    # for the prompt, populated only when prompt_cache_auto_segment is enabled
+    # on a trimmable-cache model. Used by the non-batched path to insert one
+    # trimmed cache entry per boundary in addition to the full entry.
+    segment_boundaries: list[tuple[int, str]] | None = None
 
 
 class MLXLMHandler:
@@ -131,6 +205,7 @@ class MLXLMHandler:
         prompt_cache_size: int = 10,
         prompt_cache_max_bytes: int = 1 << 63,
         prompt_cache_dir: str | None = None,
+        prompt_cache_auto_segment: bool = False,
         kv_bits: int | None = None,
         kv_group_size: int = 64,
         quantized_kv_start: int = 0,
@@ -172,8 +247,16 @@ class MLXLMHandler:
         prompt_cache_max_bytes : int
             Maximum total bytes retained by prompt KV caches before eviction.
         prompt_cache_dir : str | None
-            Directory used for disk-backed prompt KV cache payloads. If None,
-            a process-local temporary directory is used.
+            Directory used for disk-backed prompt KV cache payloads. When set,
+            the cache persists across restarts and is rehydrated on startup
+            (gated by a model/KV-config fingerprint). If None, a process-local
+            temporary directory is used and removed on shutdown.
+        prompt_cache_auto_segment : bool
+            When True, insert one trimmed cache entry per role boundary (in
+            addition to the full entry) so multi-turn and tool-heavy
+            conversations can reuse cached prefixes mid-history. Only applies
+            to trimmable KV caches; non-trimmable caches fall back to the
+            existing single full-entry behavior. Default is False.
         kv_bits : int | None
             Number of bits for KV cache quantization. None disables quantization.
         kv_group_size : int
@@ -195,7 +278,7 @@ class MLXLMHandler:
         """
         self.model_path = model_path
         from ..models.mlx_lm import MLX_LM
-        from ..utils.prompt_cache import LRUPromptCache
+        from ..utils.prompt_cache import LRUPromptCache, build_cache_fingerprint
 
         self.model = MLX_LM(
             model_path,
@@ -218,12 +301,24 @@ class MLXLMHandler:
         self.enable_auto_tool_choice = enable_auto_tool_choice
         # Debug mode
         self.debug = debug
+        # Auto-segment the prompt cache at role boundaries (trimmable caches only).
+        self.prompt_cache_auto_segment = prompt_cache_auto_segment
         self.reasoning_parser_name = reasoning_parser
         self.tool_parser_name = tool_call_parser
+        # Identity of the weights + KV-cache configuration that produce cache
+        # payloads. Gates cross-restart adoption so a persisted cache is never
+        # reused under a different model or quantization setting.
+        prompt_cache_fingerprint = build_cache_fingerprint(
+            model_path=model_path,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+        )
         self.prompt_cache = LRUPromptCache(
             max_size=prompt_cache_size,
             max_bytes=prompt_cache_max_bytes,
             cache_dir=prompt_cache_dir,
+            fingerprint=prompt_cache_fingerprint,
         )
         self.message_converter = MessageConverterManager.create_converter(
             converter_name=message_converter,
@@ -307,28 +402,12 @@ class MLXLMHandler:
         with self._generation_lock:
             yield from self.model(*args, **kwargs)
 
-    def _generate_with_lock_and_cache_persist(
-        self,
-        cache_key: list[int],
-        cache: list[Any] | None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        """Run non-stream generation and persist its prompt cache on the worker thread."""
-        with self._generation_lock:
-            response = self.model(*args, **kwargs)
-            if cache is not None:
-                try:
-                    self.prompt_cache.insert_cache(cache_key + response.tokens, cache)
-                except Exception as cache_error:  # noqa: BLE001 - cache persistence is best-effort
-                    logger.warning(f"Failed to persist prompt cache: {cache_error}")
-            return response
-
     def _stream_with_lock_and_cache_persist(
         self,
         cache_key: list[int],
         cache: list[Any] | None,
         *args: Any,
+        segment_boundaries: list[tuple[int, str]] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Stream non-batched generation and persist its cache on the worker thread."""
@@ -341,9 +420,65 @@ class MLXLMHandler:
             finally:
                 if cache is not None:
                     try:
-                        self.prompt_cache.insert_cache(cache_key, cache)
+                        self._insert_segmented_cache(cache_key, cache, segment_boundaries)
                     except Exception as cache_error:  # noqa: BLE001 - cache persistence is best-effort
                         logger.warning(f"Failed to persist prompt cache: {cache_error}")
+
+    def _insert_segmented_cache(
+        self,
+        cache_key: list[int],
+        cache: list[Any],
+        boundaries: list[tuple[int, str]] | None,
+    ) -> None:
+        """Insert the full cache plus one trimmed entry per role boundary.
+
+        Always inserts the full ``cache_key -> cache`` entry (the existing
+        behaviour). When auto-segmentation supplied ``boundaries`` and the
+        model's KV cache is trimmable, additionally insert, for each boundary,
+        a deep-copied cache trimmed back to that prefix so multi-turn and
+        tool-heavy conversations can reuse cached prefixes mid-history. Each
+        trimmed entry's KV state therefore corresponds exactly to its key.
+
+        Parameters
+        ----------
+        cache_key : list[int]
+            Full prompt + generated token stream identifying the entry.
+        cache : list[Any]
+            The final KV cache produced for ``cache_key``.
+        boundaries : list[tuple[int, str]] | None
+            Ascending ``(token_offset, role)`` prefix boundaries, or ``None``
+            when auto-segmentation is disabled.
+        """
+        # Always persist the full entry (unchanged from prior behaviour).
+        self.prompt_cache.insert_cache(cache_key, cache)
+
+        if not boundaries or not self.model.cache_is_trimmable:
+            return
+
+        try:
+            from mlx_lm.models.cache import trim_prompt_cache
+        except ImportError as exc:
+            logger.debug(f"trim_prompt_cache unavailable, skipping segmentation: {exc}")
+            return
+
+        total = len(cache_key)
+        for offset, role in boundaries:
+            if not (0 < offset < total):
+                continue
+            prefix = cache_key[:offset]
+            trimmed = copy.deepcopy(cache)
+            # Drop the tail tokens so the state corresponds to exactly `prefix`.
+            num_trimmed = trim_prompt_cache(trimmed, total - offset)
+            # trim_prompt_cache returns how many tokens it actually removed;
+            # if it could not trim the requested amount the prefix state would
+            # be wrong, so skip persisting that segment.
+            if num_trimmed != total - offset:
+                logger.debug(
+                    f"Skipping segment at offset {offset}: trimmed {num_trimmed} "
+                    f"tokens, expected {total - offset}"
+                )
+                continue
+            self.prompt_cache.insert_cache(prefix, trimmed, cache_type=role)
 
     def _insert_prompt_cache(
         self,
@@ -355,6 +490,30 @@ class MLXLMHandler:
         """Insert a prompt cache while serialized with all generation workers."""
         with self._generation_lock:
             self.prompt_cache.insert_cache(cache_key, cache, cache_type=cache_type)
+
+    def _apply_checkpoint_request_data(
+        self,
+        request_data: dict[str, Any],
+        ctx: "_InferenceContext",
+    ) -> None:
+        """Attach prefill-checkpoint parameters from ``ctx`` to ``request_data``.
+
+        Mutates ``request_data`` in place, forwarding either the single
+        ``checkpoint_position`` / ``checkpoint_callback`` pair or the
+        multi-checkpoint ``checkpoints`` list to the model's ``__call__``.
+
+        Parameters
+        ----------
+        request_data : dict[str, Any]
+            Generation kwargs passed to the model; updated in place.
+        ctx : _InferenceContext
+            Inference context carrying the checkpoint configuration.
+        """
+        if ctx.checkpoint_position is not None:
+            request_data["checkpoint_position"] = ctx.checkpoint_position
+            request_data["checkpoint_callback"] = ctx.checkpoint_callback
+        if ctx.checkpoints is not None:
+            request_data["checkpoints"] = ctx.checkpoints
 
     def _compute_checkpoint_boundary(
         self,
@@ -415,6 +574,267 @@ class MLXLMHandler:
 
         return None
 
+    def _message_content_offset(
+        self,
+        messages: list[dict[str, Any]],
+        index: int,
+        input_ids: list[int],
+        chat_template_kwargs: dict[str, Any],
+    ) -> int | None:
+        """Find the token offset where ``messages[index]`` content begins.
+
+        Uses the same sentinel-substitution technique as
+        :meth:`_compute_checkpoint_boundary`, generalized to an arbitrary
+        message index: render ``messages[:index]`` plus a short sentinel
+        message in ``messages[index]``'s role, then compare token-by-token
+        against the full prompt. The divergence point is the offset at which
+        ``messages[index]`` begins.
+
+        Parameters
+        ----------
+        messages : list[dict[str, Any]]
+            The refined chat messages.
+        index : int
+            Index of the message whose start offset is sought (``> 0``).
+        input_ids : list[int]
+            Token IDs for the full prompt.
+        chat_template_kwargs : dict[str, Any]
+            Kwargs passed to the chat template (tools, etc.).
+
+        Returns
+        -------
+        int | None
+            Token offset where ``messages[index]`` begins, or ``None`` if no
+            meaningful boundary can be computed.
+        """
+        role = messages[index].get("role")
+        sentinel_messages = [*messages[:index], {"role": role, "content": "x"}]
+        try:
+            sentinel_prompt = self.model.create_input_prompt(
+                sentinel_messages, dict(chat_template_kwargs)
+            )
+            sentinel_ids = self.model.encode_prompt(sentinel_prompt)
+        except Exception:
+            logger.debug("Could not compute role boundary via sentinel substitution")
+            return None
+
+        common = 0
+        for a, b in zip(input_ids, sentinel_ids, strict=False):
+            if a != b:
+                break
+            common += 1
+
+        return common if common > 0 else None
+
+    def _compute_role_boundaries(
+        self,
+        messages: list[dict[str, Any]],
+        input_ids: list[int],
+        chat_template_kwargs: dict[str, Any],
+    ) -> list[tuple[int, str]]:
+        """Return ascending ``(token_offset, role)`` role-change boundaries.
+
+        For every role transition in ``messages`` the boundary marks the token
+        offset where the new role's block begins. Each boundary is tagged with
+        the role of the segment that *ends* at that offset, which is used as
+        the eviction-priority ``cache_type`` of the inserted entry. Consecutive
+        same-role messages are collapsed into a single segment so that, e.g., a
+        run of tool messages produces one boundary rather than several.
+
+        Parameters
+        ----------
+        messages : list[dict[str, Any]]
+            The refined chat messages.
+        input_ids : list[int]
+            Token IDs for the full prompt.
+        chat_template_kwargs : dict[str, Any]
+            Kwargs passed to the chat template (tools, etc.).
+
+        Returns
+        -------
+        list[tuple[int, str]]
+            Ascending, de-duplicated boundaries with
+            ``0 < token_offset < len(input_ids)``.
+        """
+        boundaries: list[tuple[int, str]] = []
+        if len(messages) < 2:
+            return boundaries
+
+        for index in range(1, len(messages)):
+            # Collapse consecutive same-role messages into one segment.
+            if messages[index].get("role") == messages[index - 1].get("role"):
+                continue
+            offset = self._message_content_offset(messages, index, input_ids, chat_template_kwargs)
+            if offset is None or not (0 < offset < len(input_ids)):
+                continue
+            ending_role = messages[index - 1].get("role") or "assistant"
+            # Skip duplicate offsets (different roles can resolve to the same
+            # divergence point on some templates).
+            if boundaries and boundaries[-1][0] == offset:
+                continue
+            boundaries.append((offset, ending_role))
+
+        return boundaries
+
+    def _build_role_segments(
+        self,
+        input_ids: list[int],
+        boundaries: list[tuple[int, str]],
+    ) -> tuple[list[list[int]], list[str]] | None:
+        """Split ``input_ids`` into role segments for the batched scheduler.
+
+        The batched ``BatchGenerator`` saves a cache checkpoint at every
+        non-terminal segment boundary (see ``batch_scheduler.py``), so feeding
+        it one segment per role boundary checkpoints every role transition.
+
+        Parameters
+        ----------
+        input_ids : list[int]
+            Token IDs for the full prompt.
+        boundaries : list[tuple[int, str]]
+            Ascending ``(token_offset, role)`` boundaries from
+            :meth:`_compute_role_boundaries`.
+
+        Returns
+        -------
+        tuple[list[list[int]], list[str]] | None
+            ``(segments, segment_types)`` where each segment's label is the
+            role of the segment that ends at the boundary, or ``None`` when no
+            usable boundary exists. The trailing segment is labelled
+            ``"assistant"``; the scheduler skips its (redundant) checkpoint.
+        """
+        if not boundaries:
+            return None
+        segments: list[list[int]] = []
+        segment_types: list[str] = []
+        prev = 0
+        for offset, role in boundaries:
+            segments.append(input_ids[prev:offset])
+            segment_types.append(role)
+            prev = offset
+        segments.append(input_ids[prev:])
+        segment_types.append("assistant")
+        return segments, segment_types
+
+    def _make_checkpoint_callback(self, prefix_ids: list[int], cache_type: str) -> Any:
+        """Return a callback that persists a deep-copied checkpoint for a prefix.
+
+        Used by the non-batched path's multi-checkpoint prefill: the model
+        invokes the callback with the live prompt-cache state once prefill has
+        processed exactly ``prefix_ids``, and the callback stores a deep copy
+        under that prefix so a later request sharing it gets a "shorter" trie
+        hit.
+
+        Parameters
+        ----------
+        prefix_ids : list[int]
+            Absolute token prefix this checkpoint corresponds to.
+        cache_type : str
+            Eviction-priority label for the stored entry.
+
+        Returns
+        -------
+        Any
+            A callable ``(prompt_cache_state) -> None``.
+        """
+
+        def _callback(prompt_cache_state: list[Any]) -> None:
+            self._insert_prompt_cache(
+                prefix_ids,
+                copy.deepcopy(prompt_cache_state),
+                cache_type=cache_type,
+            )
+
+        return _callback
+
+    def _build_nonbatch_checkpoints(
+        self,
+        refined_messages: list[dict[str, Any]],
+        input_ids: list[int],
+        rest_input_ids: list[int],
+        chat_template_kwargs: dict[str, Any],
+    ) -> tuple[int | None, Any, list[tuple[int, Any]] | None]:
+        """Compute prefill checkpoints for the non-batched non-trimmable path.
+
+        Trimmable caches need no checkpoints (prefixes are derived by trimming
+        after the fact). For non-trimmable caches this runs on EVERY request so
+        multi-turn conversations accumulate checkpoints at each new boundary.
+
+        With auto-segmentation it returns a multi-checkpoint list covering every
+        role boundary beyond the cached prefix (only those can be captured
+        during this prefill); otherwise it returns the single last-user-message
+        boundary, falling back to all-but-the-last token for single-turn
+        prompts.
+
+        Parameters
+        ----------
+        refined_messages : list[dict[str, Any]]
+            The refined chat messages.
+        input_ids : list[int]
+            Token IDs for the full prompt.
+        rest_input_ids : list[int]
+            Prompt suffix not covered by the loaded cache.
+        chat_template_kwargs : dict[str, Any]
+            Kwargs passed to the chat template (tools, etc.).
+
+        Returns
+        -------
+        tuple[int | None, Any, list[tuple[int, Any]] | None]
+            ``(checkpoint_position, checkpoint_callback, checkpoints)``.
+            Positions are relative to ``rest_input_ids`` (what the model
+            receives). ``checkpoints`` supersedes the single pair when set.
+        """
+        if self.model.cache_is_trimmable:
+            return None, None, None
+
+        cached_prefix_len = len(input_ids) - len(rest_input_ids)
+
+        # With auto-segmentation, checkpoint at every role boundary that lies
+        # beyond the cached prefix. This snapshots e.g. the system-prompt
+        # boundary so a fresh conversation sharing it reuses the prefix.
+        if getattr(self, "prompt_cache_auto_segment", False):
+            built: list[tuple[int, Any]] = []
+            for boundary, role in self._compute_role_boundaries(
+                refined_messages, input_ids, chat_template_kwargs
+            ):
+                if not (cached_prefix_len < boundary < len(input_ids)):
+                    continue
+                built.append(
+                    (
+                        boundary - cached_prefix_len,
+                        self._make_checkpoint_callback(input_ids[:boundary], role),
+                    )
+                )
+            if built:
+                logger.info(
+                    f"Non-trimmable cache: will checkpoint {len(built)} role "
+                    "boundaries during prefill"
+                )
+                return None, None, built
+
+        # Single-boundary fallback (auto-segmentation disabled, or it found no
+        # role boundary beyond the cached prefix — e.g. single-turn).
+        boundary = self._compute_checkpoint_boundary(
+            refined_messages, input_ids, chat_template_kwargs
+        )
+        # For single-turn messages _compute_checkpoint_boundary returns None
+        # because there is no previous-message boundary. Fall back to
+        # checkpointing all-but-the-last token so the next identical request
+        # can reuse the prefill via a "shorter" trie hit. We keep at least one
+        # remaining token so the model's generate() call still receives a
+        # non-empty input_ids.
+        if boundary is None and len(input_ids) > 1:
+            boundary = len(input_ids) - 1
+
+        if boundary is not None and boundary > cached_prefix_len:
+            # checkpoint_position is relative to rest_input_ids.
+            checkpoint_position = boundary - cached_prefix_len
+            checkpoint_callback = self._make_checkpoint_callback(input_ids[:boundary], "system")
+            logger.info(f"Non-trimmable cache: will checkpoint prefix at {boundary} tokens")
+            return checkpoint_position, checkpoint_callback, None
+
+        return None, None, None
+
     async def _build_inference_context(self, request: ChatCompletionRequest) -> "_InferenceContext":
         """Build the common inference context shared by stream and non-stream paths.
 
@@ -466,14 +886,29 @@ class MLXLMHandler:
             segments: list[list[int]] | None = None
             segment_types: list[str] | None = None
             if not self.model.cache_is_trimmable:
-                boundary = self._compute_checkpoint_boundary(
-                    refined_messages, input_ids, chat_template_kwargs
-                )
-                if boundary is None and len(input_ids) > 1:
-                    boundary = len(input_ids) - 1
-                if boundary is not None and 0 < boundary < len(input_ids):
-                    segments = [input_ids[:boundary], input_ids[boundary:]]
-                    segment_types = ["system", "assistant"]
+                # With auto-segmentation, split at every role boundary so the
+                # scheduler checkpoints each role transition (e.g. the system
+                # prompt boundary), maximizing cross-request prefix reuse.
+                if getattr(self, "prompt_cache_auto_segment", False):
+                    role_segments = self._build_role_segments(
+                        input_ids,
+                        self._compute_role_boundaries(
+                            refined_messages, input_ids, chat_template_kwargs
+                        ),
+                    )
+                    if role_segments is not None:
+                        segments, segment_types = role_segments
+                # Fall back to the single last-user-message boundary split when
+                # auto-segmentation is disabled or produced no usable boundary.
+                if segments is None:
+                    boundary = self._compute_checkpoint_boundary(
+                        refined_messages, input_ids, chat_template_kwargs
+                    )
+                    if boundary is None and len(input_ids) > 1:
+                        boundary = len(input_ids) - 1
+                    if boundary is not None and 0 < boundary < len(input_ids):
+                        segments = [input_ids[:boundary], input_ids[boundary:]]
+                        segment_types = ["system", "assistant"]
 
             return _InferenceContext(
                 rest_input_ids=input_ids,
@@ -509,51 +944,15 @@ class MLXLMHandler:
         # new cache entries [B,X,Y,Z] instead of updating [A,B,X,Y,Z].
         cache_key = input_ids[:]
 
-        checkpoint_position: int | None = None
-        checkpoint_callback = None
-
         # For hybrid models with non-trimmable caches (e.g. Qwen3.5,
         # Nemotron-H, Jamba), the "longer cache trim" path in
         # fetch_nearest_cache is blocked because ArraysCache state
-        # cannot be trimmed.  Save a checkpoint at the last-message
-        # boundary so subsequent requests with the same prefix can
-        # reuse the cached state via the "shorter" trie path.
-        #
-        # This runs on EVERY request (not just cache misses) so that
-        # multi-turn conversations accumulate checkpoints at each new
-        # message boundary, rather than only at the first request's.
-        if not self.model.cache_is_trimmable:
-            boundary = self._compute_checkpoint_boundary(
-                refined_messages, input_ids, chat_template_kwargs
-            )
-            # For single-turn messages _compute_checkpoint_boundary
-            # returns None because there is no previous-message
-            # boundary.  Fall back to checkpointing all-but-the-last
-            # token so the next identical request can reuse the
-            # prefill via a "shorter" trie hit.  We keep at least one
-            # remaining token so the model's generate() call still
-            # receives a non-empty input_ids.
-            if boundary is None and len(input_ids) > 1:
-                boundary = len(input_ids) - 1
-
-            cached_prefix_len = len(input_ids) - len(rest_input_ids)
-            if boundary is not None and boundary > cached_prefix_len:
-                # checkpoint_position is relative to rest_input_ids
-                # (which is what the model receives as input_ids).
-                checkpoint_position = boundary - cached_prefix_len
-                prefix_ids = input_ids[:boundary]
-
-                def checkpoint_callback(
-                    prompt_cache_state: list[Any],
-                    _prefix_ids: list[int] = prefix_ids,
-                ) -> None:
-                    self._insert_prompt_cache(
-                        _prefix_ids,
-                        copy.deepcopy(prompt_cache_state),
-                        cache_type="system",
-                    )
-
-                logger.info(f"Non-trimmable cache: will checkpoint prefix at {boundary} tokens")
+        # cannot be trimmed.  Save checkpoints at message boundaries so
+        # subsequent requests with a shared prefix can reuse the cached state
+        # via the "shorter" trie path.
+        checkpoint_position, checkpoint_callback, checkpoints = self._build_nonbatch_checkpoints(
+            refined_messages, input_ids, rest_input_ids, chat_template_kwargs
+        )
 
         total_input_tokens = len(input_ids)
         total_remaining_tokens = len(rest_input_ids)
@@ -581,6 +980,16 @@ class MLXLMHandler:
 
         prompt_progress_callback = make_prompt_progress_callback() if self.debug else None
 
+        # Auto-segmentation only applies to trimmable caches: each boundary's
+        # KV state is derived by trimming a copy of the final cache back to the
+        # prefix. Non-trimmable caches keep the single-checkpoint behaviour
+        # handled above via ``checkpoint_callback``.
+        segment_boundaries: list[tuple[int, str]] | None = None
+        if getattr(self, "prompt_cache_auto_segment", False) and self.model.cache_is_trimmable:
+            segment_boundaries = self._compute_role_boundaries(
+                refined_messages, input_ids, chat_template_kwargs
+            )
+
         return _InferenceContext(
             rest_input_ids=rest_input_ids,
             cache=cache,
@@ -592,6 +1001,8 @@ class MLXLMHandler:
             prompt_progress_callback=prompt_progress_callback,
             checkpoint_position=checkpoint_position,
             checkpoint_callback=checkpoint_callback,
+            checkpoints=checkpoints,
+            segment_boundaries=segment_boundaries,
         )
 
     def _normalize_nonbatch_cache_hit(
@@ -685,9 +1096,7 @@ class MLXLMHandler:
                 "prompt_progress_callback": ctx.prompt_progress_callback,
                 **model_params,
             }
-            if ctx.checkpoint_position is not None:
-                request_data["checkpoint_position"] = ctx.checkpoint_position
-                request_data["checkpoint_callback"] = ctx.checkpoint_callback
+            self._apply_checkpoint_request_data(request_data, ctx)
 
             if self.debug:
                 debug_request_data = self._with_effective_sampling_params(request_data)
@@ -698,7 +1107,11 @@ class MLXLMHandler:
                 )
                 request_data["verbose"] = True
 
-            use_batch = self._is_request_batchable(request) and ctx.checkpoint_position is None
+            use_batch = (
+                self._is_request_batchable(request)
+                and ctx.checkpoint_position is None
+                and ctx.checkpoints is None
+            )
             if use_batch:
                 scheduler = await self._get_or_start_scheduler()
                 response_generator = self._submit_batched_stream(scheduler, ctx)
@@ -707,6 +1120,7 @@ class MLXLMHandler:
                     self._stream_with_lock_and_cache_persist,
                     list(ctx.cache_key),
                     ctx.cache,
+                    segment_boundaries=ctx.segment_boundaries,
                     input_ids=ctx.rest_input_ids,
                     prompt_cache=ctx.cache,
                     stream=True,
@@ -1015,6 +1429,7 @@ class MLXLMHandler:
                     prompt_tokens_details=PromptTokenUsageInfo(
                         cached_tokens=_coerce_cached_tokens(total_cached_tokens, final_chunk)
                     ),
+                    timings=CompletionTimingsInfo.from_stats(final_chunk),
                 )
             }
 
@@ -1059,14 +1474,14 @@ class MLXLMHandler:
                 "prompt_progress_callback": ctx.prompt_progress_callback,
                 **model_params,
             }
-            if ctx.checkpoint_position is not None:
-                request_data["checkpoint_position"] = ctx.checkpoint_position
-                request_data["checkpoint_callback"] = ctx.checkpoint_callback
+            self._apply_checkpoint_request_data(request_data, ctx)
 
             if self.debug:
+                debug_request_data = self._with_effective_sampling_params(request_data)
+                log_debug_request(debug_request_data)
                 log_debug_model_dispatch(
                     "mlx_lm.generate_text_response.submit",
-                    self._with_effective_sampling_params(request_data),
+                    debug_request_data,
                 )
 
             response = await self._run_nonstream_generation(request, ctx, request_data)
@@ -1160,6 +1575,10 @@ class MLXLMHandler:
                                 tool_parser.get_tool_close(),
                             )
                             parsed_response["content"] = stripped_content or None
+
+                # Self-healing: recover well-formed tool-call blocks that the model
+                # emitted *inside* the reasoning span (see helper for details).
+                _recover_misplaced_tool_calls(parsed_response, tool_parser, debug=self.debug)
             else:
                 parsed_response["content"] = response_text
 
@@ -1192,6 +1611,7 @@ class MLXLMHandler:
                 prompt_tokens_details=PromptTokenUsageInfo(
                     cached_tokens=_coerce_cached_tokens(total_cached_tokens, response)
                 ),
+                timings=CompletionTimingsInfo.from_stats(response),
             )
 
             return {"response": parsed_response, "usage": usage}
@@ -1356,17 +1776,68 @@ class MLXLMHandler:
         Kept as a standalone method so :meth:`generate_text_response` stays
         under the complexity budget enforced by ruff.
         """
-        if self._is_request_batchable(request) and ctx.checkpoint_position is None:
+        if (
+            self._is_request_batchable(request)
+            and ctx.checkpoint_position is None
+            and ctx.checkpoints is None
+        ):
             scheduler = await self._get_or_start_scheduler()
             return await self._collect_batched_response(scheduler, ctx)
-        return await self.inference_worker.submit(
-            self._generate_with_lock_and_cache_persist,
+        return await self._collect_nonbatched_response(ctx, request_data)
+
+    async def _collect_nonbatched_response(
+        self,
+        ctx: "_InferenceContext",
+        request_data: dict[str, Any],
+    ) -> Any:
+        """Drain the single-request stream into a ``CompletionResponse``.
+
+        The non-batched non-streaming path runs through ``submit_stream`` and
+        accumulates here rather than via a single blocking ``submit`` call, so
+        a client disconnect can cancel generation between tokens: closing this
+        async generator sets the inference worker's ``cancel_event``, which
+        breaks the worker loop. The accumulated result is identical to the
+        model's own non-streaming :class:`~app.models.mlx_lm.CompletionResponse`.
+        """
+        # Lazy import — tests stub ``app.models.mlx_lm`` with a minimal fake
+        # that doesn't export CompletionResponse; a module-level import would
+        # break those test setups.
+        from ..models.mlx_lm import CompletionResponse
+
+        stream = self.inference_worker.submit_stream(
+            self._stream_with_lock_and_cache_persist,
             list(ctx.cache_key),
             ctx.cache,
             input_ids=ctx.rest_input_ids,
             prompt_cache=ctx.cache,
-            stream=False,
+            stream=True,
             **request_data,
+        )
+        text_parts: list[str] = []
+        tokens: list[int] = []
+        final_chunk = None
+        try:
+            async for chunk in stream:
+                if chunk is None:
+                    continue
+                if chunk.text:
+                    text_parts.append(chunk.text)
+                tokens.append(chunk.token)
+                if chunk.finish_reason:
+                    final_chunk = chunk
+        finally:
+            # Closing the generator promptly sets the worker's cancel_event so a
+            # cancelled/disconnected request stops generating mid-stream.
+            await stream.aclose()
+
+        return CompletionResponse(
+            text="".join(text_parts),
+            tokens=tokens,
+            peak_memory=final_chunk.peak_memory if final_chunk else 0.0,
+            generation_tps=final_chunk.generation_tps if final_chunk else 0.0,
+            prompt_tps=final_chunk.prompt_tps if final_chunk else 0.0,
+            prompt_tokens=(final_chunk.prompt_tokens if final_chunk else len(ctx.rest_input_ids)),
+            generation_tokens=final_chunk.generation_tokens if final_chunk else len(tokens),
         )
 
     async def _collect_batched_response(
@@ -1390,16 +1861,23 @@ class MLXLMHandler:
         text_parts: list[str] = []
         tokens: list[int] = []
         final_chunk = None
-        async for chunk in stream:
-            if chunk.text:
-                text_parts.append(chunk.text)
-            tokens.append(chunk.token)
-            if chunk.finish_reason is not None:
-                final_chunk = chunk
-                break
+        try:
+            async for chunk in stream:
+                if chunk.text:
+                    text_parts.append(chunk.text)
+                tokens.append(chunk.token)
+                if chunk.finish_reason is not None:
+                    final_chunk = chunk
+                    break
+        finally:
+            # Closing the generator promptly sets the scheduler's per-request
+            # cancel_event so a cancelled/disconnected request is removed from
+            # the batch instead of generating to completion.
+            await stream.aclose()
 
         generation_tokens = final_chunk.generation_tokens if final_chunk else len(tokens)
         generation_tps = final_chunk.generation_tps if final_chunk else 0.0
+        prompt_tps = final_chunk.prompt_tps if final_chunk else 0.0
         peak_memory = final_chunk.peak_memory if final_chunk else 0.0
         prompt_tokens = final_chunk.prompt_tokens if final_chunk else len(ctx.rest_input_ids)
         cached_prompt_tokens = final_chunk.cached_prompt_tokens if final_chunk else 0
@@ -1408,7 +1886,7 @@ class MLXLMHandler:
             tokens=tokens,
             peak_memory=peak_memory,
             generation_tps=generation_tps,
-            prompt_tps=0.0,
+            prompt_tps=prompt_tps,
             prompt_tokens=prompt_tokens,
             generation_tokens=generation_tokens,
             cached_prompt_tokens=cached_prompt_tokens,
@@ -1505,7 +1983,9 @@ class MLXLMHandler:
                 "repetition_penalty": request.repetition_penalty,
                 "repetition_context_size": request.repetition_context_size,
                 "presence_penalty": request.presence_penalty,
+                "presence_context_size": request.presence_context_size,
                 "frequency_penalty": request.frequency_penalty,
+                "frequency_context_size": request.frequency_context_size,
                 "xtc_probability": request.xtc_probability,
                 "xtc_threshold": request.xtc_threshold,
                 "logit_bias": request.logit_bias,

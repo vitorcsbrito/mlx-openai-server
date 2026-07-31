@@ -231,6 +231,7 @@ Supported endpoints:
 | `POST /v1/images/generations` | `image-generation` |
 | `POST /v1/images/edits` | `image-edit` |
 | `POST /v1/embeddings` | `embeddings` |
+| `POST /v1/rerank` | `rerank` |
 | `POST /v1/audio/transcriptions` | `whisper` |
 
 The request `model` should be the model path, `--served-model-name`, or YAML `served_model_name`.
@@ -240,7 +241,7 @@ The request `model` should be the model path, `--served-model-name`, or YAML `se
 | Option | Default | Notes |
 |--------|---------|-------|
 | `--model-path` | required | Local path or Hugging Face repo |
-| `--model-type` | `lm` | `lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `whisper` |
+| `--model-type` | `lm` | `lm`, `multimodal`, `image-generation`, `image-edit`, `embeddings`, `rerank`, `whisper` |
 | `--served-model-name` | model path | Alias accepted in API requests |
 | `--host` | `0.0.0.0` | Bind host |
 | `--port` | `8000` | Bind port |
@@ -265,7 +266,7 @@ LM-specific memory and batching options:
 | `--disable-batching` | `false` | Disable continuous batching; required if per-request positive `seed` values must be honored |
 | `--prompt-cache-size` | `10` | Retained prompt KV cache entries |
 | `--max-bytes` | unbounded | Prompt KV cache byte budget |
-| `--prompt-cache-dir` | temp dir | Directory for disk-backed prompt KV cache payloads |
+| `--prompt-cache-dir` | temp dir | Directory for disk-backed prompt KV cache payloads; when set, the cache persists across restarts and is rehydrated on startup (reused only for a matching model/KV-cache config) |
 | `--kv-bits` | unset | KV cache quantization bits, usually `4` or `8` |
 | `--kv-group-size` | `64` | KV quantization group size |
 | `--quantized-kv-start` | `0` | Token step where KV quantization starts |

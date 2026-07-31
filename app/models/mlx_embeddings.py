@@ -3,6 +3,8 @@ import gc
 import mlx.core as mx
 from mlx_embeddings.utils import load
 
+from ._qwen3_vl_state import reset_rope_cache
+
 
 class MLX_Embeddings:
     """
@@ -49,6 +51,7 @@ class MLX_Embeddings:
             )
 
             # Generate embeddings
+            reset_rope_cache(self.model)
             outputs = self.model(
                 mx.array(inputs["input_ids"]), attention_mask=mx.array(inputs["attention_mask"])
             ).text_embeds
